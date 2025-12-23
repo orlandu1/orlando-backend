@@ -46,8 +46,10 @@ app.use((err, req, res, next) => {
 });
 
 const port = Number(process.env.PORT) || 3001;
-app.listen(port, () => {
+app.set('trust proxy', 1);
+
+app.listen(port, '0.0.0.0', () => {
 	// eslint-disable-next-line no-console
-	console.log(`[backend] API servindo em http://localhost:${port}`);
+	console.log(`[backend] API servindo na porta ${port}`);
 });
 
