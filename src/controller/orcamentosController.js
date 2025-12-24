@@ -1,5 +1,5 @@
 import { sql } from "../db/db.js"
-import { put } from "@vercel/blob"
+import { del, put } from "@vercel/blob"
 import crypto from "node:crypto"
 
 const getUserId = (req) => String(req?.auth?.sub || "").trim()
@@ -521,11 +521,15 @@ export class OrcamentosController {
 				ORDER BY data DESC, created_at DESC
 			`
 			return res.json({ ok: true, pagamentos: rows })
-		} catch {
+		} catch (err) {
+			console.error("[orcamentos:listPagamentos]", err)
+			const details =
+				process.env.NODE_ENV === "production" ? undefined : String(err?.message || err)
 			return res.status(500).json({
 				ok: false,
 				error: "DB_ERROR",
 				message: "Erro ao consultar o banco.",
+				...(details ? { details } : {}),
 			})
 		}
 	}
@@ -563,8 +567,10 @@ export class OrcamentosController {
 		const compNome = comp ? (comp.name || "").toString() : null
 		const compTipo = comp ? (comp.type || "").toString() : null
 		const compTamanho = comp ? Number(comp.size) : null
-		const compUrl = comp ? (comp.url ?? comp.dataUrl ?? "").toString() : null
-		const compPathname = comp ? (comp.pathname ?? "").toString() : null
+		const compUrlRaw = comp ? (comp.url ?? comp.dataUrl ?? "").toString() : ""
+		const compUrl = compUrlRaw.trim() ? compUrlRaw.trim() : null
+		const compPathnameRaw = comp ? (comp.pathname ?? "").toString() : ""
+		const compPathname = compPathnameRaw.trim() ? compPathnameRaw.trim() : null
 
 		if (compUrl && isDataUrl(compUrl)) {
 			return res.status(400).json({
@@ -586,7 +592,7 @@ export class OrcamentosController {
 				VALUES (
 					${userId}, ${codigo}, ${dataStr}::date, ${valorNum},
 					${compNome}, ${compTipo}, ${Number.isFinite(compTamanho) ? compTamanho : null},
-					${compUrl}, ${compPathname}, CASE WHEN ${compUrl} IS NULL THEN NULL ELSE now() END,
+					${compUrl}, ${compPathname}, CASE WHEN ${compUrl}::text IS NULL THEN NULL ELSE now() END,
 					${compUrl}
 				)
 				RETURNING
@@ -606,11 +612,27 @@ export class OrcamentosController {
 			`
 
 			return res.status(201).json({ ok: true, pagamento: rows[0] })
-		} catch {
+		} catch (err) {
+			// Se o upload já aconteceu no frontend e o INSERT falhou,
+			// tenta limpar o arquivo para evitar órfãos no Blob Storage.
+			if (process.env.BLOB_READ_WRITE_TOKEN) {
+				const target = compPathname || compUrl
+				if (target) {
+					try {
+						await del(target, { token: process.env.BLOB_READ_WRITE_TOKEN })
+					} catch (cleanupErr) {
+						console.error("[orcamentos:createPagamento:blobCleanup]", cleanupErr)
+					}
+				}
+			}
+			console.error("[orcamentos:createPagamento]", err)
+			const details =
+				process.env.NODE_ENV === "production" ? undefined : String(err?.message || err)
 			return res.status(400).json({
 				ok: false,
 				error: "DB_ERROR",
 				message: "Não foi possível lançar o pagamento.",
+				...(details ? { details } : {}),
 			})
 		}
 	}
@@ -720,11 +742,15 @@ export class OrcamentosController {
 			}
 
 			return res.json({ ok: true, pagamento: rows[0] })
-		} catch {
+		} catch (err) {
+			console.error("[orcamentos:updatePagamento]", err)
+			const details =
+				process.env.NODE_ENV === "production" ? undefined : String(err?.message || err)
 			return res.status(400).json({
 				ok: false,
 				error: "DB_ERROR",
 				message: "Não foi possível atualizar o pagamento.",
+				...(details ? { details } : {}),
 			})
 		}
 	}
@@ -760,7 +786,11 @@ export class OrcamentosController {
 			const rows = await sql`
 				DELETE FROM orcamento_pagamentos
 				WHERE codigo = ${codigoStr}
-				RETURNING codigo AS id
+				RETURNING
+					codigo AS id,
+					comprovante_pathname AS pathname,
+					comprovante_url AS url,
+					comprovante_data_url AS "dataUrl"
 			`
 			if (!rows || rows.length === 0) {
 				return res.status(404).json({
@@ -769,12 +799,31 @@ export class OrcamentosController {
 					message: "Pagamento não encontrado.",
 				})
 			}
-			return res.json({ ok: true })
-		} catch {
+
+			let blobDeleted = false
+			if (process.env.BLOB_READ_WRITE_TOKEN) {
+				const pathname = (rows[0]?.pathname || "").toString().trim()
+				const url = (rows[0]?.url || rows[0]?.dataUrl || "").toString().trim()
+				const target = pathname || url
+				if (target) {
+					try {
+						await del(target, { token: process.env.BLOB_READ_WRITE_TOKEN })
+						blobDeleted = true
+					} catch (blobErr) {
+						console.error("[orcamentos:deletePagamento:blobDelete]", blobErr)
+					}
+				}
+			}
+			return res.json({ ok: true, blobDeleted })
+		} catch (err) {
+			console.error("[orcamentos:deletePagamento]", err)
+			const details =
+				process.env.NODE_ENV === "production" ? undefined : String(err?.message || err)
 			return res.status(400).json({
 				ok: false,
 				error: "DB_ERROR",
 				message: "Não foi possível excluir o pagamento.",
+				...(details ? { details } : {}),
 			})
 		}
 	}
