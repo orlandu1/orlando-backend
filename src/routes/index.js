@@ -2,6 +2,7 @@ import { Router } from 'express';
 import authRoute from './authRoute.js';
 import userRoute from './userRoute.js';
 import orcamentosRoute from './orcamentosRoute.js';
+import projetosRoute from './projetosRoute.js';
 
 const router = Router();
 
@@ -12,5 +13,6 @@ router.get('/health', (req, res) => {
 router.use('/auth', authRoute);
 router.use('/users', userRoute);
 router.use('/orcamentos', orcamentosRoute);
+router.use('/projetos', projetosRoute);
 
 export default router;

@@ -2,6 +2,11 @@ import { sql } from "../db/db.js"
 import { del, put } from "@vercel/blob"
 import crypto from "node:crypto"
 
+import {
+	sendOrcamentoAprovadoEmail,
+	sendServicoProntoEmail,
+} from "../services/email/brevoEmail.js"
+
 const getUserId = (req) => String(req?.auth?.sub || "").trim()
 
 const getRole = (req) => {
@@ -12,7 +17,63 @@ const getRole = (req) => {
 	return r
 }
 
+const isOperatorRole = (role) => role >= 2
 const isAdminRole = (role) => role >= 3
+
+const ensureDefaultProjeto = async (userId) => {
+	const existing = await sql`
+		SELECT id
+		FROM projetos
+		WHERE owner_user_id = ${userId} AND is_default = TRUE
+		LIMIT 1
+	`
+	if (existing?.[0]?.id) return String(existing[0].id)
+
+	const userRows = await sql`
+		SELECT COALESCE(NULLIF(name, ''), username) AS name
+		FROM users
+		WHERE id = ${userId}
+		LIMIT 1
+	`
+	const nome = String(userRows?.[0]?.name || "Projeto").trim() || "Projeto"
+	const created = await sql`
+		INSERT INTO projetos (owner_user_id, nome, is_default)
+		VALUES (${userId}, ${nome}, TRUE)
+		RETURNING id
+	`
+	return String(created?.[0]?.id)
+}
+
+const resolveProjectId = async (req, userId) => {
+	const raw = req?.query?.projectId ?? req?.body?.projectId
+	const projectId = String(raw || "").trim()
+	if (projectId) return projectId
+	return ensureDefaultProjeto(userId)
+}
+
+const canAccessProjeto = async ({ projectId, userId, role }) => {
+	if (!projectId) return { ok: false, status: 400, message: "Projeto inválido." }
+	if (!userId) return { ok: false, status: 401, message: "Token inválido ou expirado." }
+	if (isOperatorRole(role)) return { ok: true }
+
+	const rows = await sql`
+		SELECT
+			p.owner_user_id AS "ownerUserId",
+			EXISTS(
+				SELECT 1
+				FROM projeto_usuarios pu
+				WHERE pu.projeto_id = p.id AND pu.user_id = ${userId}
+			) AS "isMember"
+		FROM projetos p
+		WHERE p.id = ${projectId}
+		LIMIT 1
+	`
+	if (!rows || rows.length === 0) return { ok: false, status: 404, message: "Projeto não encontrado." }
+	const ownerUserId = String(rows[0].ownerUserId)
+	const isMember = rows[0].isMember === true
+	if (ownerUserId === userId || isMember) return { ok: true }
+	return { ok: false, status: 403, message: "Sem permissão." }
+}
 
 const toNumber = (value) => {
 	const n = Number(value)
@@ -20,6 +81,15 @@ const toNumber = (value) => {
 }
 
 const isDataUrl = (value) => typeof value === "string" && value.startsWith("data:")
+
+const maskEmail = (email) => {
+	const s = String(email || "").trim()
+	const at = s.indexOf("@")
+	if (at <= 1) return s ? "***" : ""
+	const local = s.slice(0, at)
+	const domain = s.slice(at + 1)
+	return `${local[0]}***@${domain}`
+}
 
 const safeFilename = (name) =>
 	String(name || "")
@@ -118,11 +188,22 @@ export class OrcamentosController {
 
 	async listServicos(req, res) {
 		const userId = getUserId(req)
+		const role = getRole(req)
 		if (!userId) {
 			return res.status(401).json({
 				ok: false,
 				error: "UNAUTHORIZED",
 				message: "Token inválido ou expirado.",
+			})
+		}
+
+		const projectId = await resolveProjectId(req, userId)
+		const access = await canAccessProjeto({ projectId, userId, role })
+		if (!access.ok) {
+			return res.status(access.status).json({
+				ok: false,
+				error: access.status === 404 ? "NOT_FOUND" : "FORBIDDEN",
+				message: access.message,
 			})
 		}
 
@@ -137,6 +218,7 @@ export class OrcamentosController {
 					feito,
 					feito_em AS "feitoEm"
 				FROM orcamento_servicos
+				WHERE project_id = ${projectId}
 				ORDER BY created_at DESC
 			`
 			return res.json({ ok: true, servicos: rows })
@@ -167,6 +249,18 @@ export class OrcamentosController {
 			})
 		}
 
+		const projectId = await resolveProjectId(req, userId)
+		const projectRows = await sql`
+			SELECT owner_user_id AS "ownerUserId"
+			FROM projetos
+			WHERE id = ${projectId}
+			LIMIT 1
+		`
+		if (!projectRows || projectRows.length === 0) {
+			return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Projeto não encontrado." })
+		}
+		const ownerUserId = String(projectRows[0].ownerUserId)
+
 		const { servico, custo } = req.body || {}
 		const servicoStr = (servico || "").toString().trim()
 		const custoNum = toNumber(custo)
@@ -181,8 +275,8 @@ export class OrcamentosController {
 		try {
 			const codigo = await nextServicoCodigo()
 			const rows = await sql`
-				INSERT INTO orcamento_servicos (user_id, codigo, servico, custo, aprovacao, feito)
-				VALUES (${userId}, ${codigo}, ${servicoStr}, ${custoNum}, 'pendente', NULL)
+				INSERT INTO orcamento_servicos (user_id, project_id, codigo, servico, custo, aprovacao, feito)
+				VALUES (${ownerUserId}, ${projectId}, ${codigo}, ${servicoStr}, ${custoNum}, 'pendente', NULL)
 				RETURNING
 					codigo AS id,
 					servico,
@@ -304,11 +398,21 @@ export class OrcamentosController {
 			})
 		}
 
+		const projectId = await resolveProjectId(req, userId)
+		const access = await canAccessProjeto({ projectId, userId, role })
+		if (!access.ok) {
+			return res.status(access.status).json({
+				ok: false,
+				error: access.status === 404 ? "NOT_FOUND" : "FORBIDDEN",
+				message: access.message,
+			})
+		}
+
 		try {
 			const currentRows = await sql`
-				SELECT aprovacao
+				SELECT user_id, servico, custo, aprovacao, feito
 				FROM orcamento_servicos
-				WHERE codigo = ${codigoStr}
+				WHERE codigo = ${codigoStr} AND project_id = ${projectId}
 				LIMIT 1
 			`
 			if (!currentRows || currentRows.length === 0) {
@@ -320,6 +424,25 @@ export class OrcamentosController {
 			}
 
 			const prevAprovacao = String(currentRows[0].aprovacao)
+			const prevFeito = currentRows[0].feito === true
+			const ownerUserId = String(currentRows[0].user_id)
+
+			let userEmail = null
+			let userName = null
+			if (ownerUserId) {
+				const userRows = await sql`
+					SELECT
+						email,
+						COALESCE(NULLIF(name, ''), username) AS name
+					FROM users
+					WHERE id = ${ownerUserId}
+					LIMIT 1
+				`
+				if (userRows && userRows.length > 0) {
+					userEmail = String(userRows[0].email || "").trim() || null
+					userName = String(userRows[0].name || "").trim() || null
+				}
+			}
 			// Cliente: aprovado uma vez, não volta atrás
 			if (!isAdmin && aprovacaoStr === "aprovado" && prevAprovacao === "aprovado") {
 				return res.status(403).json({
@@ -330,6 +453,7 @@ export class OrcamentosController {
 			}
 			const shouldClearAprovadoEm = prevAprovacao === "aprovado"
 
+			let updated
 			// Mantém a lógica simples e robusta (evita casts de data por string)
 			if (aprovacaoStr === undefined) {
 				const rows = await sql`
@@ -348,7 +472,7 @@ export class OrcamentosController {
 							ELSE NULL
 						END,
 						updated_at = now()
-					WHERE codigo = ${codigoStr}
+					WHERE codigo = ${codigoStr} AND project_id = ${projectId}
 					RETURNING
 						codigo AS id,
 						servico,
@@ -358,10 +482,8 @@ export class OrcamentosController {
 						feito,
 						feito_em AS "feitoEm"
 				`
-				return res.json({ ok: true, servico: rows[0] })
-			}
-
-			if (aprovacaoStr === "aprovado") {
+				updated = rows?.[0]
+			} else if (aprovacaoStr === "aprovado") {
 				const rows = await sql`
 					UPDATE orcamento_servicos
 					SET
@@ -380,7 +502,7 @@ export class OrcamentosController {
 							ELSE NULL
 						END,
 						updated_at = now()
-					WHERE codigo = ${codigoStr}
+					WHERE codigo = ${codigoStr} AND project_id = ${projectId}
 					RETURNING
 						codigo AS id,
 						servico,
@@ -390,42 +512,105 @@ export class OrcamentosController {
 						feito,
 						feito_em AS "feitoEm"
 				`
-				return res.json({ ok: true, servico: rows[0] })
+				updated = rows?.[0]
+			} else {
+				const rows = await sql`
+					UPDATE orcamento_servicos
+					SET
+						servico = COALESCE(${isAdmin ? servicoStr ?? null : null}, servico),
+						custo = COALESCE(${isAdmin ? custoNum ?? null : null}, custo),
+						aprovacao = ${aprovacaoStr},
+						aprovado_em = CASE
+							WHEN ${shouldClearAprovadoEm} THEN NULL
+							ELSE aprovado_em
+						END,
+						feito = CASE
+							WHEN ${feitoProvided} THEN ${feitoValue}::boolean
+							ELSE feito
+						END,
+						feito_em = CASE
+							WHEN NOT ${feitoProvided} THEN feito_em
+							WHEN ${feitoValue}::boolean IS TRUE THEN COALESCE(feito_em, now())
+							WHEN ${feitoValue}::boolean IS FALSE THEN NULL
+							ELSE NULL
+						END,
+						updated_at = now()
+					WHERE codigo = ${codigoStr} AND project_id = ${projectId}
+					RETURNING
+						codigo AS id,
+						servico,
+						custo,
+						aprovacao,
+						aprovado_em AS "aprovadoEm",
+						feito,
+						feito_em AS "feitoEm"
+				`
+				updated = rows?.[0]
 			}
 
-			const rows = await sql`
-				UPDATE orcamento_servicos
-				SET
-					servico = COALESCE(${isAdmin ? servicoStr ?? null : null}, servico),
-					custo = COALESCE(${isAdmin ? custoNum ?? null : null}, custo),
-					aprovacao = ${aprovacaoStr},
-					aprovado_em = CASE
-						WHEN ${shouldClearAprovadoEm} THEN NULL
-						ELSE aprovado_em
-					END,
-					feito = CASE
-						WHEN ${feitoProvided} THEN ${feitoValue}::boolean
-						ELSE feito
-					END,
-					feito_em = CASE
-						WHEN NOT ${feitoProvided} THEN feito_em
-						WHEN ${feitoValue}::boolean IS TRUE THEN COALESCE(feito_em, now())
-						WHEN ${feitoValue}::boolean IS FALSE THEN NULL
-						ELSE NULL
-					END,
-					updated_at = now()
-				WHERE codigo = ${codigoStr}
-				RETURNING
-					codigo AS id,
-					servico,
-					custo,
-					aprovacao,
-					aprovado_em AS "aprovadoEm",
-					feito,
-					feito_em AS "feitoEm"
-			`
+			if (!updated) {
+				return res.status(404).json({
+					ok: false,
+					error: "NOT_FOUND",
+					message: "Serviço não encontrado.",
+				})
+			}
 
-			return res.json({ ok: true, servico: rows[0] })
+			const newAprovacao = String(updated.aprovacao)
+			const newFeito = updated.feito === true
+			const shouldNotifyAprovado = prevAprovacao !== "aprovado" && newAprovacao === "aprovado"
+			const shouldNotifyFeito = !prevFeito && newFeito
+
+			if (shouldNotifyAprovado || shouldNotifyFeito) {
+				console.log("[orcamentos:updateServico:notify]", {
+					codigo: codigoStr,
+					prevAprovacao,
+					newAprovacao,
+					prevFeito,
+					newFeito,
+					ownerUserId,
+					actorUserId: userId,
+					userEmail: userEmail ? maskEmail(userEmail) : null,
+				})
+			}
+
+			if ((shouldNotifyAprovado || shouldNotifyFeito) && userEmail) {
+				try {
+					if (shouldNotifyAprovado) {
+						const r1 = await sendOrcamentoAprovadoEmail({
+							toEmail: userEmail,
+							toName: userName,
+							codigo: codigoStr,
+							servico: updated.servico,
+							custo: updated.custo,
+						})
+						console.log("[orcamentos:updateServico:email:aprovado]", {
+							ok: r1?.ok === true,
+							skipped: Boolean(r1?.skipped),
+							reason: r1?.reason,
+							to: maskEmail(userEmail),
+						})
+					}
+					if (shouldNotifyFeito) {
+						const r2 = await sendServicoProntoEmail({
+							toEmail: userEmail,
+							toName: userName,
+							codigo: codigoStr,
+							servico: updated.servico,
+						})
+						console.log("[orcamentos:updateServico:email:feito]", {
+							ok: r2?.ok === true,
+							skipped: Boolean(r2?.skipped),
+							reason: r2?.reason,
+							to: maskEmail(userEmail),
+						})
+					}
+				} catch (notifyErr) {
+					console.error("[orcamentos:updateServico:email]", notifyErr)
+				}
+			}
+
+			return res.json({ ok: true, servico: updated })
 		} catch (err) {
 			console.error("[orcamentos:updateServico]", err)
 			const details =
@@ -468,10 +653,12 @@ export class OrcamentosController {
 			})
 		}
 
+		const projectId = await resolveProjectId(req, userId)
+
 		try {
 			const rows = await sql`
 				DELETE FROM orcamento_servicos
-				WHERE codigo = ${codigoStr}
+				WHERE codigo = ${codigoStr} AND project_id = ${projectId}
 				RETURNING codigo AS id
 			`
 			if (!rows || rows.length === 0) {
@@ -493,11 +680,22 @@ export class OrcamentosController {
 
 	async listPagamentos(req, res) {
 		const userId = getUserId(req)
+		const role = getRole(req)
 		if (!userId) {
 			return res.status(401).json({
 				ok: false,
 				error: "UNAUTHORIZED",
 				message: "Token inválido ou expirado.",
+			})
+		}
+
+		const projectId = await resolveProjectId(req, userId)
+		const access = await canAccessProjeto({ projectId, userId, role })
+		if (!access.ok) {
+			return res.status(access.status).json({
+				ok: false,
+				error: access.status === 404 ? "NOT_FOUND" : "FORBIDDEN",
+				message: access.message,
 			})
 		}
 
@@ -518,6 +716,7 @@ export class OrcamentosController {
 						)
 					END AS comprovante
 				FROM orcamento_pagamentos
+				WHERE project_id = ${projectId}
 				ORDER BY data DESC, created_at DESC
 			`
 			return res.json({ ok: true, pagamentos: rows })
@@ -552,6 +751,18 @@ export class OrcamentosController {
 			})
 		}
 
+		const projectId = await resolveProjectId(req, userId)
+		const projectRows = await sql`
+			SELECT owner_user_id AS "ownerUserId"
+			FROM projetos
+			WHERE id = ${projectId}
+			LIMIT 1
+		`
+		if (!projectRows || projectRows.length === 0) {
+			return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Projeto não encontrado." })
+		}
+		const ownerUserId = String(projectRows[0].ownerUserId)
+
 		const { data, valor, comprovante } = req.body || {}
 		const dataStr = (data || "").toString().trim()
 		const valorNum = toNumber(valor)
@@ -584,13 +795,13 @@ export class OrcamentosController {
 			const codigo = await nextPagamentoCodigo()
 			const rows = await sql`
 				INSERT INTO orcamento_pagamentos (
-					user_id, codigo, data, valor,
+					user_id, project_id, codigo, data, valor,
 					comprovante_nome, comprovante_tipo, comprovante_tamanho,
 					comprovante_url, comprovante_pathname, comprovante_uploaded_at,
 					comprovante_data_url
 				)
 				VALUES (
-					${userId}, ${codigo}, ${dataStr}::date, ${valorNum},
+					${ownerUserId}, ${projectId}, ${codigo}, ${dataStr}::date, ${valorNum},
 					${compNome}, ${compTipo}, ${Number.isFinite(compTamanho) ? compTamanho : null},
 					${compUrl}, ${compPathname}, CASE WHEN ${compUrl}::text IS NULL THEN NULL ELSE now() END,
 					${compUrl}
@@ -698,6 +909,8 @@ export class OrcamentosController {
 			})
 		}
 
+		const projectId = await resolveProjectId(req, userId)
+
 		try {
 			const rows = await sql`
 				UPDATE orcamento_pagamentos
@@ -716,7 +929,7 @@ export class OrcamentosController {
 					-- compat: mantém o campo antigo preenchido
 					comprovante_data_url = COALESCE(${compUrl ?? null}, comprovante_data_url),
 					updated_at = now()
-				WHERE codigo = ${codigoStr}
+				WHERE codigo = ${codigoStr} AND project_id = ${projectId}
 				RETURNING
 					codigo AS id,
 					to_char(data, 'YYYY-MM-DD') AS data,
@@ -782,10 +995,12 @@ export class OrcamentosController {
 			})
 		}
 
+		const projectId = await resolveProjectId(req, userId)
+
 		try {
 			const rows = await sql`
 				DELETE FROM orcamento_pagamentos
-				WHERE codigo = ${codigoStr}
+				WHERE codigo = ${codigoStr} AND project_id = ${projectId}
 				RETURNING
 					codigo AS id,
 					comprovante_pathname AS pathname,
