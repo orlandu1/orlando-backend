@@ -48,7 +48,16 @@ const resolveProjectId = async (req, userId) => {
 	const raw = req?.query?.projectId ?? req?.body?.projectId
 	const projectId = String(raw || "").trim()
 	if (projectId) return projectId
-	return ensureDefaultProjeto(userId)
+	
+	// Busca projeto do cliente sem criar automaticamente
+	const existing = await sql`
+		SELECT id
+		FROM projetos
+		WHERE owner_user_id = ${userId}
+		ORDER BY is_default DESC, created_at ASC
+		LIMIT 1
+	`
+	return existing?.[0]?.id ? String(existing[0].id) : null
 }
 
 const canAccessProjeto = async ({ projectId, userId, role }) => {

@@ -502,7 +502,19 @@ export class ProjetosController {
 		}
 
 		try {
-			const projeto = await ensureDefaultProjeto(userId)
+			// Busca projeto do cliente sem criar automaticamente
+			const existing = await sql`
+				SELECT 
+					p.id,
+					p.owner_user_id AS "ownerUserId",
+					p.nome,
+					p.is_default AS "isDefault"
+				FROM projetos p
+				WHERE p.owner_user_id = ${userId}
+				ORDER BY p.is_default DESC, p.created_at ASC
+				LIMIT 1
+			`
+			const projeto = existing?.[0] || null
 			return res.json({ ok: true, projeto })
 		} catch {
 			return res.status(500).json({ ok: false, error: "DB_ERROR", message: "Erro ao consultar o banco." })
@@ -624,7 +636,72 @@ export class ProjetosController {
 					feito,
 					feito_em AS "feitoEm"
 			`
-			return res.status(201).json({ ok: true, servico: rows[0] })
+			const createdServico = rows[0]
+
+			// Enviar notificações por email
+			try {
+				// Buscar informações do projeto e do cliente (owner)
+				const projectInfo = await sql`
+					SELECT 
+						p.nome AS "projetoNome",
+						u.email AS "clienteEmail",
+						COALESCE(NULLIF(u.name, ''), u.username) AS "clienteNome"
+					FROM projetos p
+					JOIN users u ON u.id = p.owner_user_id
+					WHERE p.id = ${projectId}
+					LIMIT 1
+				`
+
+				const projetoNome = projectInfo?.[0]?.projetoNome || "Projeto"
+				const clienteEmail = projectInfo?.[0]?.clienteEmail ? String(projectInfo[0].clienteEmail).trim() : ""
+				const clienteNome = projectInfo?.[0]?.clienteNome ? String(projectInfo[0].clienteNome).trim() : ""
+
+				const mod = await import("../services/email/brevoEmail.js")
+
+				// Enviar email para o cliente (dono do projeto)
+				if (clienteEmail) {
+					await mod.sendNovoServicoEmail({
+						toEmail: clienteEmail,
+						toName: clienteNome,
+						codigo,
+						servico: servicoStr,
+						custo: custoNum,
+						projetoNome,
+						isAdmin: false,
+					})
+				}
+
+				// Buscar todos os administradores (role >= 3)
+				const admins = await sql`
+					SELECT 
+						email,
+						COALESCE(NULLIF(name, ''), username) AS name
+					FROM users
+					WHERE role >= 3 AND email IS NOT NULL AND email != ''
+				`
+
+				// Enviar email para cada administrador
+				for (const admin of admins) {
+					const adminEmail = String(admin.email || "").trim()
+					const adminNome = String(admin.name || "").trim()
+					if (adminEmail) {
+						await mod.sendNovoServicoEmail({
+							toEmail: adminEmail,
+							toName: adminNome,
+							codigo,
+							servico: servicoStr,
+							custo: custoNum,
+							projetoNome,
+							isAdmin: true,
+						})
+					}
+				}
+			} catch (emailError) {
+				// Log do erro mas não falha a requisição
+				console.error("[createServico] Erro ao enviar emails de notificação:", emailError)
+			}
+
+			return res.status(201).json({ ok: true, servico: createdServico })
 		} catch {
 			return res.status(400).json({ ok: false, error: "DB_ERROR", message: "Não foi possível cadastrar o serviço." })
 		}
@@ -816,7 +893,7 @@ export class ProjetosController {
 				return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Serviço não encontrado." })
 			}
 
-			// Notificações: envia para o dono do registro (cliente)
+			// Notificações: envia para o dono do registro (cliente) e administradores
 			const newAprovacao = String(updated.aprovacao)
 			const newFeito = updated.feito === true
 			const shouldNotifyAprovado = prevAprovacao !== "aprovado" && newAprovacao === "aprovado"
@@ -824,38 +901,90 @@ export class ProjetosController {
 
 			if (shouldNotifyAprovado || shouldNotifyFeito) {
 				try {
-					// Busca email do owner
-					const userRows = await sql`
-						SELECT email, COALESCE(NULLIF(name, ''), username) AS name
-						FROM users
-						WHERE id = ${ownerUserId}
+					// Buscar informações do projeto e do cliente (owner)
+					const projectInfo = await sql`
+						SELECT 
+							p.nome AS "projetoNome",
+							u.email AS "clienteEmail",
+							COALESCE(NULLIF(u.name, ''), u.username) AS "clienteNome"
+						FROM projetos p
+						JOIN users u ON u.id = p.owner_user_id
+						WHERE p.id = ${projectId}
 						LIMIT 1
 					`
-					const userEmail = userRows?.[0]?.email ? String(userRows[0].email).trim() : ""
-					const userName = userRows?.[0]?.name ? String(userRows[0].name).trim() : ""
+
+					const projetoNome = projectInfo?.[0]?.projetoNome || "Projeto"
+					const clienteEmail = projectInfo?.[0]?.clienteEmail ? String(projectInfo[0].clienteEmail).trim() : ""
+					const clienteNome = projectInfo?.[0]?.clienteNome ? String(projectInfo[0].clienteNome).trim() : ""
+
 					// Import lazy para evitar circular (mantém compat com orcamentosController)
 					const mod = await import("../services/email/brevoEmail.js")
-					if (userEmail) {
+
+					// Enviar email para o cliente (dono do projeto)
+					if (clienteEmail) {
 						if (shouldNotifyAprovado) {
 							await mod.sendOrcamentoAprovadoEmail({
-								toEmail: userEmail,
-								toName: userName,
+								toEmail: clienteEmail,
+								toName: clienteNome,
 								codigo: codigoStr,
 								servico: updated.servico,
 								custo: updated.custo,
+								projetoNome,
+								isAdmin: false,
 							})
 						}
 						if (shouldNotifyFeito) {
 							await mod.sendServicoProntoEmail({
-								toEmail: userEmail,
-								toName: userName,
+								toEmail: clienteEmail,
+								toName: clienteNome,
 								codigo: codigoStr,
 								servico: updated.servico,
+								projetoNome,
+								isAdmin: false,
 							})
 						}
 					}
-				} catch {
-					// ignore notificações
+
+					// Buscar todos os administradores (role >= 3)
+					const admins = await sql`
+						SELECT 
+							email,
+							COALESCE(NULLIF(name, ''), username) AS name
+						FROM users
+						WHERE role >= 3 AND email IS NOT NULL AND email != ''
+					`
+
+					// Enviar email para cada administrador
+					for (const admin of admins) {
+						const adminEmail = String(admin.email || "").trim()
+						const adminNome = String(admin.name || "").trim()
+						if (adminEmail) {
+							if (shouldNotifyAprovado) {
+								await mod.sendOrcamentoAprovadoEmail({
+									toEmail: adminEmail,
+									toName: adminNome,
+									codigo: codigoStr,
+									servico: updated.servico,
+									custo: updated.custo,
+									projetoNome,
+									isAdmin: true,
+								})
+							}
+							if (shouldNotifyFeito) {
+								await mod.sendServicoProntoEmail({
+									toEmail: adminEmail,
+									toName: adminNome,
+									codigo: codigoStr,
+									servico: updated.servico,
+									projetoNome,
+									isAdmin: true,
+								})
+							}
+						}
+					}
+				} catch (emailError) {
+					// Log do erro mas não falha a requisição
+					console.error("[updateServico] Erro ao enviar emails de notificação:", emailError)
 				}
 			}
 

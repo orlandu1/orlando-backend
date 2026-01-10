@@ -124,8 +124,10 @@ export const sendEmail = async ({ to, subject, text, html }) => {
 	}
 }
 
-export const sendOrcamentoAprovadoEmail = async ({ toEmail, toName, codigo, servico, custo }) => {
-	const subject = `Orçamento aprovado: ${codigo}`
+export const sendOrcamentoAprovadoEmail = async ({ toEmail, toName, codigo, servico, custo, projetoNome, isAdmin = false }) => {
+	const subject = isAdmin
+		? `Orçamento aprovado pelo cliente - Projeto: ${projetoNome || codigo}`
+		: `Orçamento aprovado: ${codigo}`
 	const nome = String(toName || "").trim()
 	const greeting = nome ? `Olá, ${nome}!` : "Olá!"
 	const custoFmt =
@@ -133,8 +135,15 @@ export const sendOrcamentoAprovadoEmail = async ({ toEmail, toName, codigo, serv
 			? ""
 			: `\nValor: R$ ${Number(custo).toFixed(2).replace(".", ",")}`
 
-	const text = `${greeting}\n\nRecebemos a aprovação do orçamento do serviço:\n- Código: ${codigo}\n- Serviço: ${servico || "(não informado)"}${custoFmt}\n\nEm caso de dúvidas, responda este email.`
-	const html = `<p>${greeting}</p><p>Recebemos a aprovação do orçamento do serviço:</p><ul><li><strong>Código:</strong> ${codigo}</li><li><strong>Serviço:</strong> ${servico || "(não informado)"}</li>${
+	const introText = isAdmin
+		? "O cliente aprovou o orçamento do serviço"
+		: "Recebemos a aprovação do orçamento do serviço"
+
+	const projetoInfo = projetoNome && isAdmin ? `\n- Projeto: ${projetoNome}` : ""
+	const projetoHtml = projetoNome && isAdmin ? `<li><strong>Projeto:</strong> ${projetoNome}</li>` : ""
+
+	const text = `${greeting}\n\n${introText}:${projetoInfo}\n- Código: ${codigo}\n- Serviço: ${servico || "(não informado)"}${custoFmt}\n\nEm caso de dúvidas, responda este email.`
+	const html = `<p>${greeting}</p><p>${introText}:</p><ul>${projetoHtml}<li><strong>Código:</strong> ${codigo}</li><li><strong>Serviço:</strong> ${servico || "(não informado)"}</li>${
 		custo === undefined || custo === null
 			? ""
 			: `<li><strong>Valor:</strong> R$ ${Number(custo).toFixed(2).replace(".", ",")}</li>`
@@ -148,13 +157,52 @@ export const sendOrcamentoAprovadoEmail = async ({ toEmail, toName, codigo, serv
 	})
 }
 
-export const sendServicoProntoEmail = async ({ toEmail, toName, codigo, servico }) => {
-	const subject = `Serviço pronto: ${codigo}`
+export const sendServicoProntoEmail = async ({ toEmail, toName, codigo, servico, projetoNome, isAdmin = false }) => {
+	const subject = isAdmin
+		? `Serviço concluído - Projeto: ${projetoNome || codigo}`
+		: `Serviço pronto: ${codigo}`
 	const nome = String(toName || "").trim()
 	const greeting = nome ? `Olá, ${nome}!` : "Olá!"
 
-	const text = `${greeting}\n\nSeu serviço foi marcado como pronto:\n- Código: ${codigo}\n- Serviço: ${servico || "(não informado)"}\n\nEm caso de dúvidas, responda este email.`
-	const html = `<p>${greeting}</p><p>Seu serviço foi marcado como pronto:</p><ul><li><strong>Código:</strong> ${codigo}</li><li><strong>Serviço:</strong> ${servico || "(não informado)"}</li></ul><p>Em caso de dúvidas, responda este email.</p>`
+	const introText = isAdmin
+		? "Um serviço foi marcado como pronto"
+		: "Seu serviço foi marcado como pronto"
+
+	const projetoInfo = projetoNome && isAdmin ? `\n- Projeto: ${projetoNome}` : ""
+	const projetoHtml = projetoNome && isAdmin ? `<li><strong>Projeto:</strong> ${projetoNome}</li>` : ""
+
+	const text = `${greeting}\n\n${introText}:${projetoInfo}\n- Código: ${codigo}\n- Serviço: ${servico || "(não informado)"}\n\nEm caso de dúvidas, responda este email.`
+	const html = `<p>${greeting}</p><p>${introText}:</p><ul>${projetoHtml}<li><strong>Código:</strong> ${codigo}</li><li><strong>Serviço:</strong> ${servico || "(não informado)"}</li></ul><p>Em caso de dúvidas, responda este email.</p>`
+
+	return sendEmail({
+		to: nome ? `${nome} <${toEmail}>` : toEmail,
+		subject,
+		text,
+		html,
+	})
+}
+
+export const sendNovoServicoEmail = async ({ toEmail, toName, codigo, servico, custo, projetoNome, isAdmin = false }) => {
+	const subject = isAdmin 
+		? `Novo serviço cadastrado no projeto: ${projetoNome}` 
+		: `Novo serviço cadastrado no seu projeto: ${projetoNome}`
+	const nome = String(toName || "").trim()
+	const greeting = nome ? `Olá, ${nome}!` : "Olá!"
+	const custoFmt =
+		custo === undefined || custo === null
+			? ""
+			: `\nValor: R$ ${Number(custo).toFixed(2).replace(".", ",")}`
+
+	const introText = isAdmin 
+		? "Um novo serviço foi cadastrado no sistema"
+		: "Um novo serviço foi cadastrado no seu projeto"
+
+	const text = `${greeting}\n\n${introText}:\n- Projeto: ${projetoNome}\n- Código: ${codigo}\n- Serviço: ${servico || "(não informado)"}${custoFmt}\n\nAguardando aprovação do cliente.\n\nEm caso de dúvidas, responda este email.`
+	const html = `<p>${greeting}</p><p>${introText}:</p><ul><li><strong>Projeto:</strong> ${projetoNome}</li><li><strong>Código:</strong> ${codigo}</li><li><strong>Serviço:</strong> ${servico || "(não informado)"}</li>${
+		custo === undefined || custo === null
+			? ""
+			: `<li><strong>Valor:</strong> R$ ${Number(custo).toFixed(2).replace(".", ",")}</li>`
+	}</ul><p>Aguardando aprovação do cliente.</p><p>Em caso de dúvidas, responda este email.</p>`
 
 	return sendEmail({
 		to: nome ? `${nome} <${toEmail}>` : toEmail,
