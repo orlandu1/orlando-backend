@@ -1,6 +1,3 @@
-import nodemailer from "nodemailer"
-
-let cachedTransporter = null
 let warnedMisconfig = false
 
 const truthy = (v) => {
@@ -22,32 +19,37 @@ const isEmailEnabled = () => {
 }
 
 const getConfig = () => {
-	const host = String(process.env.BREVO_SMTP_HOST || "").trim()
-	const port = Number(process.env.BREVO_SMTP_PORT || 587)
-	const user = String(process.env.BREVO_SMTP_USER || "").trim()
-	const pass = String(process.env.BREVO_SMTP_PASS || "").trim()
+	const apiKey = String(process.env.BREVO_API_KEY || "").trim()
 	const fromEmail = String(process.env.EMAIL_FROM || "").trim()
 	const fromName = String(process.env.EMAIL_FROM_NAME || "").trim()
 
-	return { host, port, user, pass, fromEmail, fromName }
+	return { apiKey, fromEmail, fromName }
 }
 
-const getTransporter = () => {
-	if (!isEmailEnabled()) return null
-	if (cachedTransporter) return cachedTransporter
+const parseEmailAddress = (addr) => {
+	// Aceita "Nome <email>" ou só "email"
+	const match = String(addr || "").match(/^(.+?)\s*<(.+?)>$/)
+	if (match) {
+		return { name: match[1].trim(), email: match[2].trim() }
+	}
+	return { email: String(addr || "").trim() }
+}
 
-	const { host, port, user, pass, fromEmail } = getConfig()
+export const sendEmail = async ({ to, subject, text, html }) => {
+	if (!isEmailEnabled()) {
+		logDebug("skip", { reason: "EMAIL_DISABLED" })
+		return { ok: false, skipped: true, reason: "EMAIL_DISABLED" }
+	}
+
+	const { apiKey, fromEmail, fromName } = getConfig()
+	
 	logDebug("config", {
-		host: host || null,
-		port: Number.isFinite(port) ? port : null,
-		user: user ? `${user.slice(0, 2)}***${user.slice(-2)}` : null,
+		apiKey: apiKey ? `${apiKey.slice(0, 10)}***${apiKey.slice(-4)}` : null,
 		fromEmail: fromEmail || null,
 	})
+
 	const missing = []
-	if (!host) missing.push("BREVO_SMTP_HOST")
-	if (!port) missing.push("BREVO_SMTP_PORT")
-	if (!user) missing.push("BREVO_SMTP_USER")
-	if (!pass) missing.push("BREVO_SMTP_PASS")
+	if (!apiKey) missing.push("BREVO_API_KEY")
 	if (!fromEmail) missing.push("EMAIL_FROM")
 	if (missing.length > 0) {
 		if (!warnedMisconfig) {
@@ -57,37 +59,12 @@ const getTransporter = () => {
 			)
 		}
 		logDebug("skip", { reason: "MISSING_ENV", missing })
-		return null
+		return { ok: false, skipped: true, reason: "NO_CONFIG" }
 	}
 
-	cachedTransporter = nodemailer.createTransport({
-		host,
-		port,
-		secure: false,
-		requireTLS: true,
-		auth: { user, pass },
-	})
-
-	logDebug("transporter_created")
-
-	return cachedTransporter
-}
-
-const buildFrom = () => {
-	const { fromEmail, fromName } = getConfig()
-	return fromName ? `${fromName} <${fromEmail}>` : fromEmail
-}
-
-export const sendEmail = async ({ to, subject, text, html }) => {
-	const transporter = getTransporter()
-	if (!isEmailEnabled()) {
-		logDebug("skip", { reason: "EMAIL_DISABLED" })
-		return { ok: false, skipped: true, reason: "EMAIL_DISABLED" }
-	}
-	if (!transporter) {
-		logDebug("skip", { reason: "NO_TRANSPORTER" })
-		return { ok: false, skipped: true, reason: "NO_TRANSPORTER" }
-	}
+	const toAddr = parseEmailAddress(to)
+	const sender = fromName ? { name: fromName, email: fromEmail } : { email: fromEmail }
+	const toArr = [toAddr]
 
 	logDebug("send_attempt", {
 		to: String(to || ""),
@@ -97,27 +74,41 @@ export const sendEmail = async ({ to, subject, text, html }) => {
 	})
 
 	try {
-		const info = await transporter.sendMail({
-			from: buildFrom(),
-			to,
-			subject,
-			text,
-			html,
+		const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+			method: "POST",
+			headers: {
+				"accept": "application/json",
+				"api-key": apiKey,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify({
+				sender,
+				to: toArr,
+				subject,
+				textContent: text,
+				htmlContent: html,
+			}),
 		})
+
+		const data = await response.json().catch(() => ({}))
+
+		if (!response.ok) {
+			console.error("[email] Falha ao enviar email via API", {
+				status: response.status,
+				statusText: response.statusText,
+				error: data,
+			})
+			logDebug("send_failure_api", { status: response.status, data })
+			return { ok: false, error: data, message: data?.message || response.statusText }
+		}
+
 		logDebug("send_success", {
-			messageId: info?.messageId || null,
-			accepted: info?.accepted || null,
-			rejected: info?.rejected || null,
-			response: info?.response || null,
+			messageId: data?.messageId || null,
 		})
-		return { ok: true, info }
+		return { ok: true, info: data }
 	} catch (err) {
 		console.error("[email] Falha ao enviar email", {
 			message: err?.message || String(err),
-			code: err?.code,
-			response: err?.response,
-			responseCode: err?.responseCode,
-			command: err?.command,
 		})
 		logDebug("send_failure_raw", err)
 		return { ok: false, error: err, message: err?.message }
