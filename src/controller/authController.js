@@ -2,6 +2,7 @@ import { sql } from "../db/db.js"
 import { signAccessToken } from "../auth/jwt.js"
 import { verifyPassword } from "../auth/password.js"
 import { hashPassword } from "../auth/password.js"
+import { recordLoginFailure, recordLoginSuccess } from "../middleware/rateLimiter.js"
 
 export class AuthController {
 	async login(req, res) {
@@ -33,6 +34,8 @@ export class AuthController {
 				`
 
 			if (!rows || rows.length === 0) {
+				// Registra tentativa falha no rate limiter
+				await recordLoginFailure(req)
 				return res.status(401).json({
 					ok: false,
 					error: "INVALID_CREDENTIALS",
@@ -43,12 +46,17 @@ export class AuthController {
 			const user = rows[0]
 			const okPassword = await verifyPassword(password, user.password_hash)
 			if (!okPassword) {
+				// Registra tentativa falha no rate limiter
+				await recordLoginFailure(req)
 				return res.status(401).json({
 					ok: false,
 					error: "INVALID_CREDENTIALS",
 					message: "Credenciais inválidas.",
 				})
 			}
+
+			// Login bem-sucedido: reseta contador de tentativas
+			await recordLoginSuccess(req)
 
 			const token = signAccessToken(
 				{
