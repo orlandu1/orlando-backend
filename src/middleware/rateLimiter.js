@@ -406,18 +406,32 @@ export function rateLimitMiddleware(endpoint, options = {}) {
 			const blockStatus = await isBlocked(fingerprint, endpoint)
 			
 			if (blockStatus.blocked) {
-				// IMPORTANTE: Não revelar detalhes do bloqueio!
 				// Adiciona delay aleatório para dificultar timing attacks
 				await randomDelay(100, 500)
 				
-				// Log interno (não expor ao cliente)
+				// Log interno
 				console.log(`[RateLimiter] Cliente bloqueado: ${fingerprint.substring(0, 16)}... (${blockStatus.remainingTime}s restantes)`)
 				
-				// Resposta genérica - igual à resposta de credenciais inválidas
-				return res.status(401).json({
+				// Formata tempo restante para exibição
+				const remainingTime = blockStatus.remainingTime
+				let timeMessage = ""
+				
+				if (remainingTime >= 3600) {
+					const hours = Math.ceil(remainingTime / 3600)
+					timeMessage = `${hours} hora${hours > 1 ? "s" : ""}`
+				} else if (remainingTime >= 60) {
+					const minutes = Math.ceil(remainingTime / 60)
+					timeMessage = `${minutes} minuto${minutes > 1 ? "s" : ""}`
+				} else {
+					timeMessage = `${remainingTime} segundo${remainingTime > 1 ? "s" : ""}`
+				}
+				
+				// Resposta com informação de bloqueio
+				return res.status(429).json({
 					ok: false,
-					error: "INVALID_CREDENTIALS",
-					message: errorMessage,
+					error: "RATE_LIMITED",
+					message: `Muitas tentativas. Tente novamente em ${timeMessage}.`,
+					retryAfter: remainingTime,
 				})
 			}
 			
