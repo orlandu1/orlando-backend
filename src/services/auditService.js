@@ -18,8 +18,9 @@ const formatBRL = (value) => {
 
 const formatDateTimeBR = (date) => {
 	const d = date instanceof Date ? date : new Date(date || Date.now())
-	if (Number.isNaN(d.getTime())) return new Date().toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "medium" })
-	return d.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "medium" })
+	const opts = { dateStyle: "short", timeStyle: "medium", timeZone: "America/Sao_Paulo" }
+	if (Number.isNaN(d.getTime())) return new Date().toLocaleString("pt-BR", opts)
+	return d.toLocaleString("pt-BR", opts)
 }
 
 const maskEmail = (email) => {
