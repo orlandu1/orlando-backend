@@ -6,6 +6,12 @@ import {
 	sendOrcamentoAprovadoEmail,
 	sendServicoProntoEmail,
 } from "../services/email/brevoEmail.js"
+import {
+	auditAndNotify,
+	extractAuditMeta,
+	getActorInfo,
+	getProjectInfo,
+} from "../services/auditService.js"
 
 const getUserId = (req) => String(req?.auth?.sub || "").trim()
 
@@ -87,6 +93,12 @@ const canAccessProjeto = async ({ projectId, userId, role }) => {
 const toNumber = (value) => {
 	const n = Number(value)
 	return Number.isFinite(n) ? n : 0
+}
+
+const formatBRL = (value) => {
+	const num = Number(value)
+	if (!Number.isFinite(num)) return "R$ 0,00"
+	return num.toLocaleString("pt-BR", { style: "currency", currency: "BRL" })
 }
 
 const isDataUrl = (value) => typeof value === "string" && value.startsWith("data:")
@@ -565,57 +577,135 @@ export class OrcamentosController {
 				})
 			}
 
+			// --- Auditoria e notificação ---
+			const prevServicoStr = String(currentRows[0].servico || "")
+			const prevCusto = Number(currentRows[0].custo) || 0
 			const newAprovacao = String(updated.aprovacao)
 			const newFeito = updated.feito === true
-			const shouldNotifyAprovado = prevAprovacao !== "aprovado" && newAprovacao === "aprovado"
-			const shouldNotifyFeito = !prevFeito && newFeito
+			const newCusto = Number(updated.custo) || 0
+			const newServicoStr = String(updated.servico || "")
 
-			if (shouldNotifyAprovado || shouldNotifyFeito) {
-				console.log("[orcamentos:updateServico:notify]", {
-					codigo: codigoStr,
-					prevAprovacao,
-					newAprovacao,
-					prevFeito,
-					newFeito,
-					ownerUserId,
-					actorUserId: userId,
-					userEmail: userEmail ? maskEmail(userEmail) : null,
-				})
-			}
+			const custoChanged = custoNum !== undefined && prevCusto !== newCusto
+			const servicoChanged = servicoStr !== undefined && prevServicoStr !== newServicoStr
+			const aprovacaoChanged = aprovacaoStr !== undefined && prevAprovacao !== newAprovacao
+			const feitoChanged = feitoProvided && (prevFeito !== newFeito || (feitoParsed === null && currentRows[0].feito !== null))
 
-			if ((shouldNotifyAprovado || shouldNotifyFeito) && userEmail) {
+			const shouldAudit = custoChanged || servicoChanged || aprovacaoChanged || feitoChanged
+
+			if (shouldAudit) {
 				try {
-					if (shouldNotifyAprovado) {
-						const r1 = await sendOrcamentoAprovadoEmail({
-							toEmail: userEmail,
-							toName: userName,
-							codigo: codigoStr,
-							servico: updated.servico,
-							custo: updated.custo,
-						})
-						console.log("[orcamentos:updateServico:email:aprovado]", {
-							ok: r1?.ok === true,
-							skipped: Boolean(r1?.skipped),
-							reason: r1?.reason,
-							to: maskEmail(userEmail),
+					const { ip, userAgent: ua } = extractAuditMeta(req)
+					const actorInfo = await getActorInfo(userId)
+					const projInfo = await getProjectInfo(projectId)
+					const target = projInfo ? {
+						userId: projInfo.ownerUserId,
+						name: projInfo.ownerNome,
+						email: projInfo.ownerEmail,
+					} : { userId: ownerUserId, name: userName, email: userEmail }
+
+					const auditActions = []
+
+					if (aprovacaoChanged) {
+						if (newAprovacao === "aprovado") {
+							auditActions.push({
+								action: "servico.aprovado",
+								details: [
+									{ label: "Código", value: codigoStr, bold: true },
+									{ label: "Serviço", value: newServicoStr },
+									{ label: "Projeto", value: projInfo?.nome },
+									{ label: "Valor", value: formatBRL(newCusto), color: "#10b981", bold: true },
+									{ label: "Status anterior", value: prevAprovacao },
+									{ label: "Novo status", value: "aprovado", color: "#10b981", bold: true },
+								],
+							})
+						} else if (prevAprovacao === "aprovado") {
+							auditActions.push({
+								action: "servico.aprovacao_desfeita",
+								details: [
+									{ label: "Código", value: codigoStr, bold: true },
+									{ label: "Serviço", value: newServicoStr },
+									{ label: "Projeto", value: projInfo?.nome },
+									{ label: "Valor", value: formatBRL(newCusto), bold: true },
+									{ label: "Status anterior", value: "aprovado", color: "#10b981" },
+									{ label: "Novo status", value: newAprovacao, color: "#ef4444", bold: true },
+								],
+							})
+						} else {
+							auditActions.push({
+								action: newAprovacao === "negado" ? "servico.reprovado" : "servico.reset_aprovacao",
+								details: [
+									{ label: "Código", value: codigoStr, bold: true },
+									{ label: "Serviço", value: newServicoStr },
+									{ label: "Projeto", value: projInfo?.nome },
+									{ label: "Status anterior", value: prevAprovacao },
+									{ label: "Novo status", value: newAprovacao, bold: true },
+								],
+							})
+						}
+					}
+
+					if (custoChanged) {
+						auditActions.push({
+							action: "servico.valor_alterado",
+							details: [
+								{ label: "Código", value: codigoStr, bold: true },
+								{ label: "Serviço", value: newServicoStr },
+								{ label: "Projeto", value: projInfo?.nome },
+								{ label: "Valor anterior", value: formatBRL(prevCusto), color: "#ef4444" },
+								{ label: "Novo valor", value: formatBRL(newCusto), color: "#10b981", bold: true },
+							],
 						})
 					}
-					if (shouldNotifyFeito) {
-						const r2 = await sendServicoProntoEmail({
-							toEmail: userEmail,
-							toName: userName,
-							codigo: codigoStr,
-							servico: updated.servico,
-						})
-						console.log("[orcamentos:updateServico:email:feito]", {
-							ok: r2?.ok === true,
-							skipped: Boolean(r2?.skipped),
-							reason: r2?.reason,
-							to: maskEmail(userEmail),
+
+					if (servicoChanged) {
+						auditActions.push({
+							action: "servico.nome_alterado",
+							details: [
+								{ label: "Código", value: codigoStr, bold: true },
+								{ label: "Projeto", value: projInfo?.nome },
+								{ label: "Nome anterior", value: prevServicoStr },
+								{ label: "Novo nome", value: newServicoStr, bold: true },
+							],
 						})
 					}
-				} catch (notifyErr) {
-					console.error("[orcamentos:updateServico:email]", notifyErr)
+
+					if (feitoChanged) {
+						const feitoAction = feitoParsed === null ? "servico.reset_feito" : newFeito ? "servico.feito" : "servico.nao_feito"
+						auditActions.push({
+							action: feitoAction,
+							details: [
+								{ label: "Código", value: codigoStr, bold: true },
+								{ label: "Serviço", value: newServicoStr },
+								{ label: "Projeto", value: projInfo?.nome },
+								{ label: "Feito anterior", value: prevFeito ? "Sim" : (currentRows[0].feito === false ? "Não" : "Pendente") },
+								{ label: "Feito novo", value: feitoParsed === null ? "Pendente (resetado)" : newFeito ? "Sim" : "Não", bold: true },
+							],
+						})
+					}
+
+					for (const auditAction of auditActions) {
+						auditAndNotify({
+							action: auditAction.action,
+							entityType: "servico",
+							entityId: codigoStr,
+							projectId,
+							actor: {
+								userId,
+								name: actorInfo.name,
+								email: actorInfo.email,
+								role,
+							},
+							target,
+							ip,
+							userAgent: ua,
+							oldValue: { servico: prevServicoStr, custo: prevCusto, aprovacao: prevAprovacao, feito: currentRows[0].feito },
+							newValue: { servico: newServicoStr, custo: newCusto, aprovacao: newAprovacao, feito: updated.feito },
+							metadata: { projetoNome: projInfo?.nome },
+							emailDetails: auditAction.details,
+						}).catch((err) => console.error("[orcamentos:updateServico:audit]", err))
+					}
+				} catch (auditErr) {
+					console.error("[orcamentos:updateServico:audit]", auditErr)
 				}
 			}
 

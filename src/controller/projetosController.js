@@ -1,4 +1,10 @@
 import { sql } from "../db/db.js"
+import {
+	auditAndNotify,
+	extractAuditMeta,
+	getActorInfo,
+	getProjectInfo,
+} from "../services/auditService.js"
 
 const getUserId = (req) => String(req?.auth?.sub || "").trim()
 
@@ -12,6 +18,12 @@ const getRole = (req) => {
 
 const isOperator = (role) => role >= 2
 const isAdmin = (role) => role >= 3
+
+const formatBRL = (value) => {
+	const num = Number(value)
+	if (!Number.isFinite(num)) return "R$ 0,00"
+	return num.toLocaleString("pt-BR", { style: "currency", currency: "BRL" })
+}
 
 const toNumber = (value) => {
 	const n = Number(value)
@@ -638,67 +650,45 @@ export class ProjetosController {
 			`
 			const createdServico = rows[0]
 
-			// Enviar notificações por email
+			// Auditoria: registrar criação do serviço
 			try {
-				// Buscar informações do projeto e do cliente (owner)
-				const projectInfo = await sql`
-					SELECT 
-						p.nome AS "projetoNome",
-						u.email AS "clienteEmail",
-						COALESCE(NULLIF(u.name, ''), u.username) AS "clienteNome"
-					FROM projetos p
-					JOIN users u ON u.id = p.owner_user_id
-					WHERE p.id = ${projectId}
-					LIMIT 1
-				`
+				const { ip, userAgent } = extractAuditMeta(req)
+				const actorInfo = await getActorInfo(userId)
+				const projInfo = await getProjectInfo(projectId)
+				const target = projInfo ? {
+					userId: projInfo.ownerUserId,
+					name: projInfo.ownerNome,
+					email: projInfo.ownerEmail,
+				} : {}
 
-				const projetoNome = projectInfo?.[0]?.projetoNome || "Projeto"
-				const clienteEmail = projectInfo?.[0]?.clienteEmail ? String(projectInfo[0].clienteEmail).trim() : ""
-				const clienteNome = projectInfo?.[0]?.clienteNome ? String(projectInfo[0].clienteNome).trim() : ""
-
-				const mod = await import("../services/email/brevoEmail.js")
-
-				// Enviar email para o cliente (dono do projeto)
-				if (clienteEmail) {
-					await mod.sendNovoServicoEmail({
-						toEmail: clienteEmail,
-						toName: clienteNome,
-						codigo,
-						servico: servicoStr,
-						custo: custoNum,
-						projetoNome,
-						isAdmin: false,
-					})
-				}
-
-				// Buscar todos os administradores (role >= 3)
-				const admins = await sql`
-					SELECT 
-						email,
-						COALESCE(NULLIF(name, ''), username) AS name
-					FROM users
-					WHERE role >= 3 AND email IS NOT NULL AND email != ''
-				`
-
-				// Enviar email para cada administrador
-				for (const admin of admins) {
-					const adminEmail = String(admin.email || "").trim()
-					const adminNome = String(admin.name || "").trim()
-					if (adminEmail) {
-						await mod.sendNovoServicoEmail({
-							toEmail: adminEmail,
-							toName: adminNome,
-							codigo,
-							servico: servicoStr,
-							custo: custoNum,
-							projetoNome,
-							isAdmin: true,
-						})
-					}
-				}
-			} catch (emailError) {
-				// Log do erro mas não falha a requisição
-				console.error("[createServico] Erro ao enviar emails de notificação:", emailError)
+				auditAndNotify({
+					action: "servico.criado",
+					entityType: "servico",
+					entityId: codigo,
+					projectId,
+					actor: {
+						userId,
+						name: actorInfo.name,
+						email: actorInfo.email,
+						role,
+					},
+					target,
+					ip,
+					userAgent,
+					oldValue: null,
+					newValue: { servico: servicoStr, custo: custoNum, aprovacao: "pendente" },
+					metadata: { projetoNome: projInfo?.nome },
+					emailDetails: [
+						{ label: "Código", value: codigo, bold: true },
+						{ label: "Serviço", value: servicoStr },
+						{ label: "Projeto", value: projInfo?.nome },
+						{ label: "Valor", value: formatBRL(custoNum), color: "#f59e0b", bold: true },
+						{ label: "Status", value: "Pendente (aguardando aprovação)", color: "#f59e0b" },
+					],
+					emailSubject: `[Novo Serviço] ${codigo} — ${projInfo?.nome || "Projeto"}`,
+				}).catch((err) => console.error("[createServico:audit]", err))
+			} catch (auditErr) {
+				console.error("[createServico:audit]", auditErr)
 			}
 
 			return res.status(201).json({ ok: true, servico: createdServico })
@@ -893,98 +883,154 @@ export class ProjetosController {
 				return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Serviço não encontrado." })
 			}
 
-			// Notificações: envia para o dono do registro (cliente) e administradores
+			// --- Auditoria e notificação ---
+			const prevServicoStr = String(currentRows[0].servico || "")
+			const prevCusto = Number(currentRows[0].custo) || 0
 			const newAprovacao = String(updated.aprovacao)
 			const newFeito = updated.feito === true
-			const shouldNotifyAprovado = prevAprovacao !== "aprovado" && newAprovacao === "aprovado"
-			const shouldNotifyFeito = !prevFeito && newFeito
+			const newCusto = Number(updated.custo) || 0
+			const newServicoStr = String(updated.servico || "")
 
-			if (shouldNotifyAprovado || shouldNotifyFeito) {
+			const custoChanged = custoNum !== undefined && prevCusto !== newCusto
+			const servicoChanged = servicoStr !== undefined && prevServicoStr !== newServicoStr
+			const aprovacaoChanged = aprovacaoStr !== undefined && prevAprovacao !== newAprovacao
+			const feitoChanged = feitoProvided && (prevFeito !== newFeito || (feitoParsed === null && currentRows[0].feito !== null))
+
+			const shouldAudit = custoChanged || servicoChanged || aprovacaoChanged || feitoChanged
+
+			if (shouldAudit) {
 				try {
-					// Buscar informações do projeto e do cliente (owner)
-					const projectInfo = await sql`
-						SELECT 
-							p.nome AS "projetoNome",
-							u.email AS "clienteEmail",
-							COALESCE(NULLIF(u.name, ''), u.username) AS "clienteNome"
-						FROM projetos p
-						JOIN users u ON u.id = p.owner_user_id
-						WHERE p.id = ${projectId}
-						LIMIT 1
-					`
+					const { ip, userAgent } = extractAuditMeta(req)
+					const actorInfo = await getActorInfo(userId)
+					const projInfo = await getProjectInfo(projectId)
+					const target = projInfo ? {
+						userId: projInfo.ownerUserId,
+						name: projInfo.ownerNome,
+						email: projInfo.ownerEmail,
+					} : {}
 
-					const projetoNome = projectInfo?.[0]?.projetoNome || "Projeto"
-					const clienteEmail = projectInfo?.[0]?.clienteEmail ? String(projectInfo[0].clienteEmail).trim() : ""
-					const clienteNome = projectInfo?.[0]?.clienteNome ? String(projectInfo[0].clienteNome).trim() : ""
+					// Determine action type and build email details
+					const auditActions = []
 
-					// Import lazy para evitar circular (mantém compat com orcamentosController)
-					const mod = await import("../services/email/brevoEmail.js")
-
-					// Enviar email para o cliente (dono do projeto)
-					if (clienteEmail) {
-						if (shouldNotifyAprovado) {
-							await mod.sendOrcamentoAprovadoEmail({
-								toEmail: clienteEmail,
-								toName: clienteNome,
-								codigo: codigoStr,
-								servico: updated.servico,
-								custo: updated.custo,
-								projetoNome,
-								isAdmin: false,
+					if (aprovacaoChanged) {
+						if (newAprovacao === "aprovado") {
+							auditActions.push({
+								action: "servico.aprovado",
+								details: [
+									{ label: "Código", value: codigoStr, bold: true },
+									{ label: "Serviço", value: newServicoStr },
+									{ label: "Projeto", value: projInfo?.nome },
+									{ label: "Valor", value: formatBRL(newCusto), color: "#10b981", bold: true },
+									{ label: "Status anterior", value: prevAprovacao },
+									{ label: "Novo status", value: "aprovado", color: "#10b981", bold: true },
+								],
 							})
-						}
-						if (shouldNotifyFeito) {
-							await mod.sendServicoProntoEmail({
-								toEmail: clienteEmail,
-								toName: clienteNome,
-								codigo: codigoStr,
-								servico: updated.servico,
-								projetoNome,
-								isAdmin: false,
+						} else if (prevAprovacao === "aprovado" && newAprovacao !== "aprovado") {
+							auditActions.push({
+								action: "servico.aprovacao_desfeita",
+								details: [
+									{ label: "Código", value: codigoStr, bold: true },
+									{ label: "Serviço", value: newServicoStr },
+									{ label: "Projeto", value: projInfo?.nome },
+									{ label: "Valor", value: formatBRL(newCusto), bold: true },
+									{ label: "Status anterior", value: "aprovado", color: "#10b981" },
+									{ label: "Novo status", value: newAprovacao, color: "#ef4444", bold: true },
+								],
+							})
+						} else if (newAprovacao === "negado") {
+							auditActions.push({
+								action: "servico.reprovado",
+								details: [
+									{ label: "Código", value: codigoStr, bold: true },
+									{ label: "Serviço", value: newServicoStr },
+									{ label: "Projeto", value: projInfo?.nome },
+									{ label: "Valor", value: formatBRL(newCusto), bold: true },
+									{ label: "Status anterior", value: prevAprovacao },
+									{ label: "Novo status", value: "negado", color: "#ef4444", bold: true },
+								],
+							})
+						} else {
+							auditActions.push({
+								action: "servico.reset_aprovacao",
+								details: [
+									{ label: "Código", value: codigoStr, bold: true },
+									{ label: "Serviço", value: newServicoStr },
+									{ label: "Projeto", value: projInfo?.nome },
+									{ label: "Status anterior", value: prevAprovacao },
+									{ label: "Novo status", value: newAprovacao },
+								],
 							})
 						}
 					}
 
-					// Buscar todos os administradores (role >= 3)
-					const admins = await sql`
-						SELECT 
-							email,
-							COALESCE(NULLIF(name, ''), username) AS name
-						FROM users
-						WHERE role >= 3 AND email IS NOT NULL AND email != ''
-					`
-
-					// Enviar email para cada administrador
-					for (const admin of admins) {
-						const adminEmail = String(admin.email || "").trim()
-						const adminNome = String(admin.name || "").trim()
-						if (adminEmail) {
-							if (shouldNotifyAprovado) {
-								await mod.sendOrcamentoAprovadoEmail({
-									toEmail: adminEmail,
-									toName: adminNome,
-									codigo: codigoStr,
-									servico: updated.servico,
-									custo: updated.custo,
-									projetoNome,
-									isAdmin: true,
-								})
-							}
-							if (shouldNotifyFeito) {
-								await mod.sendServicoProntoEmail({
-									toEmail: adminEmail,
-									toName: adminNome,
-									codigo: codigoStr,
-									servico: updated.servico,
-									projetoNome,
-									isAdmin: true,
-								})
-							}
-						}
+					if (custoChanged) {
+						auditActions.push({
+							action: "servico.valor_alterado",
+							details: [
+								{ label: "Código", value: codigoStr, bold: true },
+								{ label: "Serviço", value: newServicoStr },
+								{ label: "Projeto", value: projInfo?.nome },
+								{ label: "Valor anterior", value: formatBRL(prevCusto), color: "#ef4444" },
+								{ label: "Novo valor", value: formatBRL(newCusto), color: "#10b981", bold: true },
+							],
+						})
 					}
-				} catch (emailError) {
-					// Log do erro mas não falha a requisição
-					console.error("[updateServico] Erro ao enviar emails de notificação:", emailError)
+
+					if (servicoChanged) {
+						auditActions.push({
+							action: "servico.nome_alterado",
+							details: [
+								{ label: "Código", value: codigoStr, bold: true },
+								{ label: "Projeto", value: projInfo?.nome },
+								{ label: "Nome anterior", value: prevServicoStr },
+								{ label: "Novo nome", value: newServicoStr, bold: true },
+							],
+						})
+					}
+
+					if (feitoChanged) {
+						const feitoAction = feitoParsed === null
+							? "servico.reset_feito"
+							: newFeito
+								? "servico.feito"
+								: "servico.nao_feito"
+						const feitoLabel = feitoParsed === null ? "Pendente (resetado)" : newFeito ? "Sim" : "Não"
+						auditActions.push({
+							action: feitoAction,
+							details: [
+								{ label: "Código", value: codigoStr, bold: true },
+								{ label: "Serviço", value: newServicoStr },
+								{ label: "Projeto", value: projInfo?.nome },
+								{ label: "Feito anterior", value: prevFeito ? "Sim" : (currentRows[0].feito === false ? "Não" : "Pendente") },
+								{ label: "Feito novo", value: feitoLabel, bold: true },
+							],
+						})
+					}
+
+					// Fire all audit actions in parallel (non-blocking logs)
+					for (const auditAction of auditActions) {
+						auditAndNotify({
+							action: auditAction.action,
+							entityType: "servico",
+							entityId: codigoStr,
+							projectId,
+							actor: {
+								userId,
+								name: actorInfo.name,
+								email: actorInfo.email,
+								role,
+							},
+							target,
+							ip,
+							userAgent,
+							oldValue: { servico: prevServicoStr, custo: prevCusto, aprovacao: prevAprovacao, feito: currentRows[0].feito },
+							newValue: { servico: newServicoStr, custo: newCusto, aprovacao: newAprovacao, feito: updated.feito },
+							metadata: { projetoNome: projInfo?.nome },
+							emailDetails: auditAction.details,
+						}).catch((err) => console.error("[updateServico:audit]", err))
+					}
+				} catch (auditErr) {
+					console.error("[updateServico:audit]", auditErr)
 				}
 			}
 
