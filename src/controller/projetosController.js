@@ -1183,7 +1183,40 @@ export class ProjetosController {
 					END AS comprovante
 			`
 
-			return res.status(201).json({ ok: true, pagamento: rows[0] })
+			const created = rows[0]
+
+			// Audit + email
+			const { ip, userAgent } = extractAuditMeta(req)
+			const [actorInfo, projectInfo] = await Promise.all([
+				getActorInfo(userId),
+				getProjectInfo(projectId),
+			])
+			const comprovanteUrl = compUrl || null
+			const emailDetails = [
+				{ label: "Pagamento", value: codigo, bold: true },
+				{ label: "Data", value: dataStr },
+				{ label: "Valor", value: formatBRL(valorNum), color: "#047857" },
+			]
+			if (comprovanteUrl) {
+				emailDetails.push({ label: "Comprovante", value: `<a href="${comprovanteUrl}" target="_blank" style="color: #6d28d9; text-decoration: underline;">${compNome || 'Ver comprovante'}</a>` })
+			}
+			auditAndNotify({
+				action: "pagamento.criado",
+				entityType: "pagamento",
+				entityId: codigo,
+				projectId,
+				actor: actorInfo,
+				target: projectInfo?.owner || null,
+				ip,
+				userAgent,
+				oldValue: null,
+				newValue: { data: dataStr, valor: valorNum, comprovante: compNome || null },
+				metadata: { projetoNome: projectInfo?.nome },
+				emailDetails,
+				emailSubject: `[Novo Pagamento] ${codigo} — ${projectInfo?.nome || 'Projeto'}`,
+			}).catch((err) => console.error("[audit:pagamento.criado]", err))
+
+			return res.status(201).json({ ok: true, pagamento: created })
 		} catch {
 			return res.status(400).json({ ok: false, error: "DB_ERROR", message: "Não foi possível lançar o pagamento." })
 		}
@@ -1264,7 +1297,42 @@ export class ProjetosController {
 			if (!rows || rows.length === 0) {
 				return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Pagamento não encontrado." })
 			}
-			return res.json({ ok: true, pagamento: rows[0] })
+
+			const updated = rows[0]
+
+			// Audit + email
+			const { ip, userAgent } = extractAuditMeta(req)
+			const [actorInfo, projectInfo] = await Promise.all([
+				getActorInfo(userId),
+				getProjectInfo(projectId),
+			])
+			const updatedCompUrl = updated?.comprovante?.dataUrl || compUrl || null
+			const updatedCompNome = updated?.comprovante?.name || compNome || null
+			const emailDetails = [
+				{ label: "Pagamento", value: codigoStr, bold: true },
+			]
+			if (dataStr !== undefined) emailDetails.push({ label: "Data", value: dataStr })
+			if (valorNum !== undefined) emailDetails.push({ label: "Valor", value: formatBRL(valorNum), color: "#047857" })
+			if (updatedCompUrl) {
+				emailDetails.push({ label: "Comprovante", value: `<a href="${updatedCompUrl}" target="_blank" style="color: #6d28d9; text-decoration: underline;">${updatedCompNome || 'Ver comprovante'}</a>` })
+			}
+			auditAndNotify({
+				action: "pagamento.atualizado",
+				entityType: "pagamento",
+				entityId: codigoStr,
+				projectId,
+				actor: actorInfo,
+				target: projectInfo?.owner || null,
+				ip,
+				userAgent,
+				oldValue: null,
+				newValue: { data: dataStr, valor: valorNum, comprovante: updatedCompNome },
+				metadata: { projetoNome: projectInfo?.nome },
+				emailDetails,
+				emailSubject: `[Pagamento Atualizado] ${codigoStr} — ${projectInfo?.nome || 'Projeto'}`,
+			}).catch((err) => console.error("[audit:pagamento.atualizado]", err))
+
+			return res.json({ ok: true, pagamento: updated })
 		} catch {
 			return res.status(400).json({ ok: false, error: "DB_ERROR", message: "Não foi possível atualizar o pagamento." })
 		}
@@ -1290,11 +1358,46 @@ export class ProjetosController {
 			const rows = await sql`
 				DELETE FROM orcamento_pagamentos
 				WHERE codigo = ${codigoStr} AND project_id = ${projectId}
-				RETURNING codigo AS id
+				RETURNING codigo AS id, to_char(data, 'YYYY-MM-DD') AS data, valor,
+					COALESCE(comprovante_url, comprovante_data_url) AS "compUrl",
+					comprovante_nome AS "compNome"
 			`
 			if (!rows || rows.length === 0) {
 				return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Pagamento não encontrado." })
 			}
+
+			const deleted = rows[0]
+
+			// Audit + email
+			const { ip, userAgent } = extractAuditMeta(req)
+			const [actorInfo, projectInfo] = await Promise.all([
+				getActorInfo(userId),
+				getProjectInfo(projectId),
+			])
+			const emailDetails = [
+				{ label: "Pagamento excluído", value: codigoStr, bold: true },
+				{ label: "Data", value: deleted.data || "—" },
+				{ label: "Valor", value: formatBRL(toNumber(deleted.valor)), color: "#b91c1c" },
+			]
+			if (deleted.compUrl) {
+				emailDetails.push({ label: "Comprovante (removido)", value: `<a href="${deleted.compUrl}" target="_blank" style="color: #6d28d9; text-decoration: underline;">${deleted.compNome || 'Ver comprovante'}</a>` })
+			}
+			auditAndNotify({
+				action: "pagamento.excluido",
+				entityType: "pagamento",
+				entityId: codigoStr,
+				projectId,
+				actor: actorInfo,
+				target: projectInfo?.owner || null,
+				ip,
+				userAgent,
+				oldValue: { data: deleted.data, valor: toNumber(deleted.valor), comprovante: deleted.compNome || null },
+				newValue: null,
+				metadata: { projetoNome: projectInfo?.nome },
+				emailDetails,
+				emailSubject: `[Pagamento Excluído] ${codigoStr} — ${projectInfo?.nome || 'Projeto'}`,
+			}).catch((err) => console.error("[audit:pagamento.excluido]", err))
+
 			return res.json({ ok: true })
 		} catch {
 			return res.status(400).json({ ok: false, error: "DB_ERROR", message: "Não foi possível excluir o pagamento." })

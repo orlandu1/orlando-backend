@@ -921,7 +921,40 @@ export class OrcamentosController {
 					END AS comprovante
 			`
 
-			return res.status(201).json({ ok: true, pagamento: rows[0] })
+			const created = rows[0]
+
+			// Audit + email
+			const { ip, userAgent } = extractAuditMeta(req)
+			const [actorInfo, projectInfo] = await Promise.all([
+				getActorInfo(userId),
+				getProjectInfo(projectId),
+			])
+			const comprovanteUrl = compUrl || null
+			const emailDetails = [
+				{ label: "Pagamento", value: codigo, bold: true },
+				{ label: "Data", value: dataStr },
+				{ label: "Valor", value: formatBRL(valorNum), color: "#047857" },
+			]
+			if (comprovanteUrl) {
+				emailDetails.push({ label: "Comprovante", value: `<a href="${comprovanteUrl}" target="_blank" style="color: #6d28d9; text-decoration: underline;">${compNome || 'Ver comprovante'}</a>` })
+			}
+			auditAndNotify({
+				action: "pagamento.criado",
+				entityType: "pagamento",
+				entityId: codigo,
+				projectId,
+				actor: actorInfo,
+				target: projectInfo?.owner || null,
+				ip,
+				userAgent,
+				oldValue: null,
+				newValue: { data: dataStr, valor: valorNum, comprovante: compNome || null },
+				metadata: { projetoNome: projectInfo?.nome },
+				emailDetails,
+				emailSubject: `[Novo Pagamento] ${codigo} \u2014 ${projectInfo?.nome || 'Projeto'}`,
+			}).catch((err) => console.error("[audit:pagamento.criado]", err))
+
+			return res.status(201).json({ ok: true, pagamento: created })
 		} catch (err) {
 			// Se o upload já aconteceu no frontend e o INSERT falhou,
 			// tenta limpar o arquivo para evitar órfãos no Blob Storage.
@@ -1053,7 +1086,41 @@ export class OrcamentosController {
 				})
 			}
 
-			return res.json({ ok: true, pagamento: rows[0] })
+			const updated = rows[0]
+
+			// Audit + email
+			const { ip, userAgent } = extractAuditMeta(req)
+			const [actorInfo, projectInfo] = await Promise.all([
+				getActorInfo(userId),
+				getProjectInfo(projectId),
+			])
+			const updatedCompUrl = updated?.comprovante?.dataUrl || compUrl || null
+			const updatedCompNome = updated?.comprovante?.name || compNome || null
+			const emailDetails = [
+				{ label: "Pagamento", value: codigoStr, bold: true },
+			]
+			if (dataStr !== undefined) emailDetails.push({ label: "Data", value: dataStr })
+			if (valorNum !== undefined) emailDetails.push({ label: "Valor", value: formatBRL(valorNum), color: "#047857" })
+			if (updatedCompUrl) {
+				emailDetails.push({ label: "Comprovante", value: `<a href="${updatedCompUrl}" target="_blank" style="color: #6d28d9; text-decoration: underline;">${updatedCompNome || 'Ver comprovante'}</a>` })
+			}
+			auditAndNotify({
+				action: "pagamento.atualizado",
+				entityType: "pagamento",
+				entityId: codigoStr,
+				projectId,
+				actor: actorInfo,
+				target: projectInfo?.owner || null,
+				ip,
+				userAgent,
+				oldValue: null,
+				newValue: { data: dataStr, valor: valorNum, comprovante: updatedCompNome },
+				metadata: { projetoNome: projectInfo?.nome },
+				emailDetails,
+				emailSubject: `[Pagamento Atualizado] ${codigoStr} \u2014 ${projectInfo?.nome || 'Projeto'}`,
+			}).catch((err) => console.error("[audit:pagamento.atualizado]", err))
+
+			return res.json({ ok: true, pagamento: updated })
 		} catch (err) {
 			console.error("[orcamentos:updatePagamento]", err)
 			const details =
@@ -1102,9 +1169,12 @@ export class OrcamentosController {
 				WHERE codigo = ${codigoStr} AND project_id = ${projectId}
 				RETURNING
 					codigo AS id,
+					to_char(data, 'YYYY-MM-DD') AS data,
+					valor,
 					comprovante_pathname AS pathname,
 					comprovante_url AS url,
-					comprovante_data_url AS "dataUrl"
+					comprovante_data_url AS "dataUrl",
+					comprovante_nome AS "compNome"
 			`
 			if (!rows || rows.length === 0) {
 				return res.status(404).json({
@@ -1128,6 +1198,39 @@ export class OrcamentosController {
 					}
 				}
 			}
+
+			// Audit + email
+			const deleted = rows[0]
+			const { ip, userAgent } = extractAuditMeta(req)
+			const [actorInfo, projectInfo] = await Promise.all([
+				getActorInfo(userId),
+				getProjectInfo(projectId),
+			])
+			const deletedCompUrl = (deleted.url || deleted.dataUrl || "").toString().trim() || null
+			const emailDetails = [
+				{ label: "Pagamento excluído", value: codigoStr, bold: true },
+				{ label: "Data", value: deleted.data || "—" },
+				{ label: "Valor", value: formatBRL(toNumber(deleted.valor)), color: "#b91c1c" },
+			]
+			if (deletedCompUrl) {
+				emailDetails.push({ label: "Comprovante (removido)", value: `<a href="${deletedCompUrl}" target="_blank" style="color: #6d28d9; text-decoration: underline;">${deleted.compNome || 'Ver comprovante'}</a>` })
+			}
+			auditAndNotify({
+				action: "pagamento.excluido",
+				entityType: "pagamento",
+				entityId: codigoStr,
+				projectId,
+				actor: actorInfo,
+				target: projectInfo?.owner || null,
+				ip,
+				userAgent,
+				oldValue: { data: deleted.data, valor: toNumber(deleted.valor), comprovante: deleted.compNome || null },
+				newValue: null,
+				metadata: { projetoNome: projectInfo?.nome },
+				emailDetails,
+				emailSubject: `[Pagamento Excluído] ${codigoStr} — ${projectInfo?.nome || 'Projeto'}`,
+			}).catch((err) => console.error("[audit:pagamento.excluido]", err))
+
 			return res.json({ ok: true, blobDeleted })
 		} catch (err) {
 			console.error("[orcamentos:deletePagamento]", err)

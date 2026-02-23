@@ -223,6 +223,10 @@ const actionLabels = {
 	"servico.nao_feito": "Serviço marcado como não feito",
 	"servico.reset_aprovacao": "Reset de aprovação",
 	"servico.reset_feito": "Reset de status feito",
+	"servico.criado": "Novo serviço cadastrado",
+	"pagamento.criado": "Novo pagamento lançado",
+	"pagamento.atualizado": "Pagamento atualizado",
+	"pagamento.excluido": "Pagamento excluído",
 }
 
 const getActionLabel = (action) => actionLabels[action] || action
