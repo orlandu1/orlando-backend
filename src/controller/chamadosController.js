@@ -3,6 +3,7 @@ import {
 	auditAndNotify,
 	extractAuditMeta,
 	getActorInfo,
+	getAdminEmails,
 } from "../services/auditService.js"
 
 // ---------------------------------------------------------------------------
@@ -25,6 +26,31 @@ const isOperatorRole = (role) => role >= 2
 // ---------------------------------------------------------------------------
 
 export class ChamadosController {
+	/**
+	 * GET /chamados/users
+	 * Lista usuários disponíveis para selecionar como interessados.
+	 * Somente operadores/admins.
+	 */
+	async listUsers(req, res) {
+		try {
+			const role = getRole(req)
+			if (!isOperatorRole(role)) {
+				return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "Sem permissão." })
+			}
+
+			const rows = await sql`
+				SELECT id, COALESCE(NULLIF(name, ''), username) AS name, email, role
+				FROM users
+				ORDER BY name ASC
+			`
+
+			return res.json({ ok: true, users: rows })
+		} catch (err) {
+			console.error("[ChamadosController.listUsers]", err)
+			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao listar usuários." })
+		}
+	}
+
 	/**
 	 * GET /chamados
 	 * Clientes veem apenas os próprios; operadores/admins veem todos.
@@ -53,8 +79,9 @@ export class ChamadosController {
 					ORDER BY c.created_at DESC
 				`
 			} else {
+				// Clientes veem seus próprios chamados + chamados em que são interessados
 				rows = await sql`
-					SELECT
+					SELECT DISTINCT
 						c.id,
 						c.codigo,
 						c.titulo,
@@ -64,7 +91,8 @@ export class ChamadosController {
 						c.created_at AS "criadoEm",
 						c.updated_at AS "atualizadoEm"
 					FROM chamados c
-					WHERE c.user_id = ${userId}
+					LEFT JOIN chamado_interessados ci ON ci.chamado_id = c.id AND ci.user_id = ${userId}
+					WHERE c.user_id = ${userId} OR ci.user_id IS NOT NULL
 					ORDER BY c.created_at DESC
 				`
 			}
@@ -113,9 +141,16 @@ export class ChamadosController {
 				return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Chamado não encontrado." })
 			}
 
-			// Clientes só veem seus próprios chamados
+			// Clientes só veem seus próprios chamados ou chamados em que são interessados
 			if (!isOperatorRole(role) && chamado.userId !== userId) {
-				return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "Sem permissão." })
+				const isInteressado = await sql`
+					SELECT 1 FROM chamado_interessados
+					WHERE chamado_id = ${chamadoId} AND user_id = ${userId}
+					LIMIT 1
+				`
+				if (!isInteressado || isInteressado.length === 0) {
+					return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "Sem permissão." })
+				}
 			}
 
 			// Buscar histórico
@@ -132,7 +167,19 @@ export class ChamadosController {
 				ORDER BY h.created_at DESC
 			`
 
-			return res.json({ ok: true, chamado: { ...chamado, historico } })
+			// Buscar interessados
+			const interessados = await sql`
+				SELECT
+					ci.user_id AS "userId",
+					COALESCE(NULLIF(u.name, ''), u.username) AS name,
+					u.email
+				FROM chamado_interessados ci
+				JOIN users u ON u.id = ci.user_id
+				WHERE ci.chamado_id = ${chamadoId}
+				ORDER BY u.name ASC
+			`
+
+			return res.json({ ok: true, chamado: { ...chamado, historico, interessados } })
 		} catch (err) {
 			console.error("[ChamadosController.get]", err)
 			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao buscar chamado." })
@@ -169,6 +216,15 @@ export class ChamadosController {
 			const seq = Number(seqRows?.[0]?.seq || 1)
 			const codigo = `CH-${String(seq).padStart(3, "0")}`
 
+			// Interessados (apenas operadores/admins podem definir)
+			const role = getRole(req)
+			let interessadosIds = []
+			if (isOperatorRole(role) && Array.isArray(req.body?.interessados)) {
+				interessadosIds = req.body.interessados
+					.map((id) => String(id || "").trim())
+					.filter(Boolean)
+			}
+
 			const inserted = await sql`
 				INSERT INTO chamados (user_id, codigo, titulo, descricao, prioridade)
 				VALUES (${userId}, ${codigo}, ${titulo}, ${descricao}, ${prioridade})
@@ -184,6 +240,19 @@ export class ChamadosController {
 			`
 
 			const chamado = inserted?.[0]
+
+			// Inserir interessados
+			if (chamado?.id && interessadosIds.length > 0) {
+				for (const intId of interessadosIds) {
+					try {
+						await sql`
+							INSERT INTO chamado_interessados (chamado_id, user_id)
+							VALUES (${chamado.id}, ${intId})
+							ON CONFLICT (chamado_id, user_id) DO NOTHING
+						`
+					} catch { /* ignora duplicatas ou IDs inválidos */ }
+				}
+			}
 
 			// Audit + Email (para o cliente e admins)
 			try {
@@ -284,7 +353,7 @@ export class ChamadosController {
 				VALUES (${chamadoId}, ${userId}, ${novoStatus}, ${comentario})
 			`
 
-			// Audit + Email (para o dono do chamado e admins)
+			// Audit + Email (para o dono do chamado, admins e interessados)
 			try {
 				const actorInfo = await getActorInfo(userId)
 				const meta = extractAuditMeta(req)
@@ -314,6 +383,37 @@ export class ChamadosController {
 						{ label: "Comentário", value: comentario },
 					],
 				})
+
+				// Notificar interessados (além do dono e admins)
+				try {
+					const interessados = await sql`
+						SELECT ci.user_id AS "userId", u.name, u.email
+						FROM chamado_interessados ci
+						JOIN users u ON u.id = ci.user_id
+						WHERE ci.chamado_id = ${chamadoId}
+					`
+					if (interessados.length > 0) {
+						const { sendEmail } = await import("../services/email/brevoEmail.js")
+						const adminEmails = (await getAdminEmails()).map((a) => a.email)
+						for (const int of interessados) {
+							// Não duplicar para o dono ou admins (já notificados)
+							if (int.email === chamado.ownerEmail) continue
+							if (adminEmails.includes(int.email)) continue
+							if (!int.email) continue
+
+							try {
+								const greeting = int.name ? `Olá, ${int.name}!` : "Olá!"
+								const introText = `Você é um interessado no chamado ${chamado.codigo} e houve uma atualização de status.`
+								await sendEmail({
+									to: int.name ? `${int.name} <${int.email}>` : int.email,
+									subject: `[Chamado ${chamado.codigo}] Status: ${novoStatus}`,
+									text: `${greeting}\n\n${introText}\n\nCódigo: ${chamado.codigo}\nTítulo: ${chamado.titulo}\nStatus anterior: ${chamado.status}\nNovo status: ${novoStatus}\nComentário: ${comentario}`,
+									html: `<p>${greeting}</p><p>${introText}</p><p><strong>Código:</strong> ${chamado.codigo}<br><strong>Título:</strong> ${chamado.titulo}<br><strong>Status anterior:</strong> ${chamado.status}<br><strong>Novo status:</strong> <strong>${novoStatus}</strong><br><strong>Comentário:</strong> ${comentario}</p>`,
+								})
+							} catch { /* ignore individual email failures */ }
+						}
+					}
+				} catch { /* non-blocking */ }
 			} catch { /* non-blocking */ }
 
 			return res.json({ ok: true, status: novoStatus })
