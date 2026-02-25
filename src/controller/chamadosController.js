@@ -185,7 +185,7 @@ export class ChamadosController {
 
 			const chamado = inserted?.[0]
 
-			// Audit
+			// Audit + Email (para o cliente e admins)
 			try {
 				const actorInfo = await getActorInfo(userId)
 				const meta = extractAuditMeta(req)
@@ -199,12 +199,19 @@ export class ChamadosController {
 						email: actorInfo?.email,
 						role: getRole(req),
 					},
+					target: {
+						userId,
+						name: actorInfo?.name,
+						email: actorInfo?.email,
+					},
 					ip: meta.ip,
 					userAgent: meta.userAgent,
+					emailSubject: `[Novo Chamado] ${codigo} — ${titulo}`,
 					emailDetails: [
 						{ label: "Código", value: codigo, bold: true },
 						{ label: "Título", value: titulo },
 						{ label: "Prioridade", value: prioridade },
+						{ label: "Descrição", value: descricao },
 					],
 				})
 			} catch { /* non-blocking */ }
@@ -242,9 +249,11 @@ export class ChamadosController {
 
 			// Buscar chamado atual
 			const existing = await sql`
-				SELECT id, user_id AS "userId", status, codigo
-				FROM chamados
-				WHERE id = ${chamadoId}
+				SELECT c.id, c.user_id AS "userId", c.status, c.codigo, c.titulo,
+				       u.name AS "ownerName", u.email AS "ownerEmail"
+				FROM chamados c
+				JOIN users u ON u.id = c.user_id
+				WHERE c.id = ${chamadoId}
 				LIMIT 1
 			`
 			const chamado = existing?.[0]
@@ -275,7 +284,7 @@ export class ChamadosController {
 				VALUES (${chamadoId}, ${userId}, ${novoStatus}, ${comentario})
 			`
 
-			// Audit
+			// Audit + Email (para o dono do chamado e admins)
 			try {
 				const actorInfo = await getActorInfo(userId)
 				const meta = extractAuditMeta(req)
@@ -289,12 +298,19 @@ export class ChamadosController {
 						email: actorInfo?.email,
 						role: getRole(req),
 					},
+					target: {
+						userId: chamado.userId,
+						name: chamado.ownerName,
+						email: chamado.ownerEmail,
+					},
 					ip: meta.ip,
 					userAgent: meta.userAgent,
+					emailSubject: `[Chamado ${chamado.codigo}] Status: ${novoStatus}`,
 					emailDetails: [
 						{ label: "Código", value: chamado.codigo, bold: true },
+						{ label: "Título", value: chamado.titulo },
 						{ label: "Status anterior", value: chamado.status },
-						{ label: "Novo status", value: novoStatus, bold: true },
+						{ label: "Novo status", value: novoStatus, bold: true, color: novoStatus === "Resolvido" ? "#059669" : novoStatus === "Cancelado" ? "#dc2626" : undefined },
 						{ label: "Comentário", value: comentario },
 					],
 				})

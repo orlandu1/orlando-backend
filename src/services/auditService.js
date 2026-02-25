@@ -227,6 +227,8 @@ const actionLabels = {
 	"pagamento.criado": "Novo pagamento lançado",
 	"pagamento.atualizado": "Pagamento atualizado",
 	"pagamento.excluido": "Pagamento excluído",
+	"chamado.created": "Novo chamado aberto",
+	"chamado.status_changed": "Atualização de chamado",
 }
 
 const getActionLabel = (action) => actionLabels[action] || action
