@@ -5,6 +5,7 @@ import orcamentosRoute from './orcamentosRoute.js';
 import projetosRoute from './projetosRoute.js';
 import settingsRoute from './settingsRoute.js';
 import auditRoute from './auditRoute.js';
+import chamadosRoute from './chamadosRoute.js';
 
 const router = Router();
 
@@ -18,5 +19,6 @@ router.use('/orcamentos', orcamentosRoute);
 router.use('/projetos', projetosRoute);
 router.use('/settings', settingsRoute);
 router.use('/audit', auditRoute);
+router.use('/chamados', chamadosRoute);
 
 export default router;
