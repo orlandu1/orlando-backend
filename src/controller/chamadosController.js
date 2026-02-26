@@ -1,4 +1,6 @@
 import { sql } from "../db/db.js"
+import { put, del } from "@vercel/blob"
+import crypto from "node:crypto"
 import {
 	auditAndNotify,
 	extractAuditMeta,
@@ -20,6 +22,11 @@ const getRole = (req) => {
 }
 
 const isOperatorRole = (role) => role >= 2
+
+const safeFilename = (raw) => {
+	const s = String(raw || "").trim()
+	return s.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100) || "arquivo"
+}
 
 // ---------------------------------------------------------------------------
 // Controller
@@ -73,15 +80,26 @@ export class ChamadosController {
 						c.created_at  AS "criadoEm",
 						c.updated_at  AS "atualizadoEm",
 						u.name        AS "nomeUsuario",
-						u.email       AS "emailUsuario"
+						u.email       AS "emailUsuario",
+						lm.comentario AS "ultimaMovimentacao",
+						lm.created_at AS "ultimaMovimentacaoEm",
+						lm_autor.name AS "ultimaMovimentacaoAutor"
 					FROM chamados c
 					JOIN users u ON u.id = c.user_id
+					LEFT JOIN LATERAL (
+						SELECT h.comentario, h.created_at, h.author_user_id
+						FROM chamado_historico h
+						WHERE h.chamado_id = c.id
+						ORDER BY h.created_at DESC
+						LIMIT 1
+					) lm ON true
+					LEFT JOIN users lm_autor ON lm_autor.id = lm.author_user_id
 					ORDER BY c.created_at DESC
 				`
 			} else {
 				// Clientes veem seus próprios chamados + chamados em que são interessados
 				rows = await sql`
-					SELECT DISTINCT
+					SELECT DISTINCT ON (c.id)
 						c.id,
 						c.codigo,
 						c.titulo,
@@ -89,11 +107,22 @@ export class ChamadosController {
 						c.prioridade,
 						c.status,
 						c.created_at AS "criadoEm",
-						c.updated_at AS "atualizadoEm"
+						c.updated_at AS "atualizadoEm",
+						lm.comentario AS "ultimaMovimentacao",
+						lm.created_at AS "ultimaMovimentacaoEm",
+						lm_autor.name AS "ultimaMovimentacaoAutor"
 					FROM chamados c
 					LEFT JOIN chamado_interessados ci ON ci.chamado_id = c.id AND ci.user_id = ${userId}
+					LEFT JOIN LATERAL (
+						SELECT h.comentario, h.created_at, h.author_user_id
+						FROM chamado_historico h
+						WHERE h.chamado_id = c.id
+						ORDER BY h.created_at DESC
+						LIMIT 1
+					) lm ON true
+					LEFT JOIN users lm_autor ON lm_autor.id = lm.author_user_id
 					WHERE c.user_id = ${userId} OR ci.user_id IS NOT NULL
-					ORDER BY c.created_at DESC
+					ORDER BY c.id, c.created_at DESC
 				`
 			}
 
@@ -127,12 +156,15 @@ export class ChamadosController {
 					c.descricao,
 					c.prioridade,
 					c.status,
+					c.responsavel_user_id AS "responsavelUserId",
 					c.created_at  AS "criadoEm",
 					c.updated_at  AS "atualizadoEm",
 					u.name        AS "nomeUsuario",
-					u.email       AS "emailUsuario"
+					u.email       AS "emailUsuario",
+					resp.name     AS "responsavelNome"
 				FROM chamados c
 				JOIN users u ON u.id = c.user_id
+				LEFT JOIN users resp ON resp.id = c.responsavel_user_id
 				WHERE c.id = ${chamadoId}
 				LIMIT 1
 			`
@@ -167,6 +199,30 @@ export class ChamadosController {
 				ORDER BY h.created_at DESC
 			`
 
+			// Buscar anexos agrupados por histórico
+			const anexos = await sql`
+				SELECT
+					a.id,
+					a.historico_id AS "historicoId",
+					a.nome,
+					a.tipo,
+					a.tamanho,
+					a.url,
+					a.created_at AS "criadoEm"
+				FROM chamado_anexos a
+				WHERE a.chamado_id = ${chamadoId}
+				ORDER BY a.created_at ASC
+			`
+
+			// Vincular anexos ao histórico
+			const historicoComAnexos = historico.map((h) => ({
+				...h,
+				anexos: anexos.filter((a) => a.historicoId === h.id),
+			}))
+
+			// Anexos órfãos (sem histórico, e.g. da descrição original)
+			const anexosGerais = anexos.filter((a) => !a.historicoId)
+
 			// Buscar interessados
 			const interessados = await sql`
 				SELECT
@@ -179,7 +235,17 @@ export class ChamadosController {
 				ORDER BY u.name ASC
 			`
 
-			return res.json({ ok: true, chamado: { ...chamado, historico, interessados } })
+			// Marcar como lido
+			try {
+				await sql`
+					INSERT INTO chamado_last_read (chamado_id, user_id, read_at)
+					VALUES (${chamadoId}, ${userId}, now())
+					ON CONFLICT (chamado_id, user_id)
+					DO UPDATE SET read_at = now()
+				`
+			} catch { /* non-blocking */ }
+
+			return res.json({ ok: true, chamado: { ...chamado, historico: historicoComAnexos, interessados, anexos: anexosGerais } })
 		} catch (err) {
 			console.error("[ChamadosController.get]", err)
 			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao buscar chamado." })
@@ -581,6 +647,268 @@ export class ChamadosController {
 		} catch (err) {
 			console.error("[ChamadosController.updateStatus]", err)
 			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao atualizar status." })
+		}
+	}
+
+	/**
+	 * POST /chamados/:id/anexo
+	 * Upload de arquivo anexo ao chamado (Vercel Blob Storage).
+	 * Qualquer participante pode anexar enquanto o chamado estiver aberto.
+	 */
+	async uploadAnexo(req, res) {
+		try {
+			const userId = getUserId(req)
+			const role = getRole(req)
+			const chamadoId = String(req.params.id || "").trim()
+			const historicoId = String(req.body?.historicoId || "").trim() || null
+
+			if (!chamadoId) {
+				return res.status(400).json({ ok: false, error: "BAD_REQUEST", message: "ID inválido." })
+			}
+			if (!process.env.BLOB_READ_WRITE_TOKEN) {
+				return res.status(500).json({ ok: false, error: "SERVER_MISCONFIG", message: "Blob Storage não configurado." })
+			}
+
+			const file = req.file
+			if (!file || !file.buffer || !file.originalname) {
+				return res.status(400).json({ ok: false, error: "VALIDATION", message: "Envie um arquivo no campo 'file'." })
+			}
+
+			// Buscar chamado
+			const existing = await sql`
+				SELECT c.id, c.user_id AS "userId", c.status, c.codigo
+				FROM chamados c WHERE c.id = ${chamadoId} LIMIT 1
+			`
+			const chamado = existing?.[0]
+			if (!chamado) {
+				return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Chamado não encontrado." })
+			}
+
+			if (chamado.status === "Resolvido" || chamado.status === "Cancelado") {
+				return res.status(400).json({ ok: false, error: "VALIDATION", message: "Não é possível anexar em chamados encerrados." })
+			}
+
+			// Permissão
+			if (!isOperatorRole(role) && chamado.userId !== userId) {
+				const isInt = await sql`SELECT 1 FROM chamado_interessados WHERE chamado_id = ${chamadoId} AND user_id = ${userId} LIMIT 1`
+				if (!isInt || isInt.length === 0) {
+					return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "Sem permissão." })
+				}
+			}
+
+			const original = safeFilename(file.originalname)
+			const blobId = crypto.randomUUID()
+			const pathname = `chamados/${chamado.codigo}/${blobId}-${original}`
+			const contentType = String(file.mimetype || "application/octet-stream")
+
+			const result = await put(pathname, file.buffer, {
+				access: "public",
+				contentType,
+				token: process.env.BLOB_READ_WRITE_TOKEN,
+			})
+
+			const inserted = await sql`
+				INSERT INTO chamado_anexos (chamado_id, historico_id, uploader_user_id, nome, tipo, tamanho, url, pathname)
+				VALUES (${chamadoId}, ${historicoId}, ${userId}, ${file.originalname}, ${contentType}, ${Number(file.size) || 0}, ${result.url}, ${result.pathname})
+				RETURNING id, nome, tipo, tamanho, url, created_at AS "criadoEm"
+			`
+
+			// Atualizar updated_at do chamado
+			await sql`UPDATE chamados SET updated_at = now() WHERE id = ${chamadoId}`
+
+			return res.status(201).json({ ok: true, anexo: inserted?.[0] })
+		} catch (err) {
+			console.error("[ChamadosController.uploadAnexo]", err)
+			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao enviar anexo." })
+		}
+	}
+
+	/**
+	 * POST /chamados/:id/interessados
+	 * Adicionar interessado (operadores/admins).
+	 */
+	async addInteressado(req, res) {
+		try {
+			const role = getRole(req)
+			if (!isOperatorRole(role)) {
+				return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "Sem permissão." })
+			}
+
+			const chamadoId = String(req.params.id || "").trim()
+			const targetUserId = String(req.body?.userId || "").trim()
+
+			if (!chamadoId || !targetUserId) {
+				return res.status(400).json({ ok: false, error: "BAD_REQUEST", message: "Dados inválidos." })
+			}
+
+			// Verificar se chamado existe
+			const existing = await sql`
+				SELECT c.id, c.codigo, c.titulo FROM chamados c WHERE c.id = ${chamadoId} LIMIT 1
+			`
+			if (!existing?.[0]) {
+				return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Chamado não encontrado." })
+			}
+
+			await sql`
+				INSERT INTO chamado_interessados (chamado_id, user_id)
+				VALUES (${chamadoId}, ${targetUserId})
+				ON CONFLICT (chamado_id, user_id) DO NOTHING
+			`
+
+			// Notificar o novo interessado
+			try {
+				const { sendEmail } = await import("../services/email/brevoEmail.js")
+				const intInfo = await getActorInfo(targetUserId)
+				if (intInfo?.email) {
+					const chamado = existing[0]
+					const greeting = intInfo.name ? `Olá, ${intInfo.name}!` : "Olá!"
+					await sendEmail({
+						to: intInfo.name ? `${intInfo.name} <${intInfo.email}>` : intInfo.email,
+						subject: `[Chamado ${chamado.codigo}] Você foi adicionado como interessado`,
+						text: `${greeting}\n\nVocê foi adicionado(a) como interessado(a) no chamado ${chamado.codigo} — ${chamado.titulo}.`,
+						html: `<p>${greeting}</p><p>Você foi adicionado(a) como interessado(a) no chamado <strong>${chamado.codigo}</strong> — ${chamado.titulo}.</p>`,
+					})
+				}
+			} catch { /* non-blocking */ }
+
+			return res.json({ ok: true })
+		} catch (err) {
+			console.error("[ChamadosController.addInteressado]", err)
+			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao adicionar interessado." })
+		}
+	}
+
+	/**
+	 * DELETE /chamados/:id/interessados/:userId
+	 * Remover interessado (operadores/admins).
+	 */
+	async removeInteressado(req, res) {
+		try {
+			const role = getRole(req)
+			if (!isOperatorRole(role)) {
+				return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "Sem permissão." })
+			}
+
+			const chamadoId = String(req.params.id || "").trim()
+			const targetUserId = String(req.params.userId || "").trim()
+
+			if (!chamadoId || !targetUserId) {
+				return res.status(400).json({ ok: false, error: "BAD_REQUEST", message: "Dados inválidos." })
+			}
+
+			await sql`
+				DELETE FROM chamado_interessados
+				WHERE chamado_id = ${chamadoId} AND user_id = ${targetUserId}
+			`
+
+			return res.json({ ok: true })
+		} catch (err) {
+			console.error("[ChamadosController.removeInteressado]", err)
+			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao remover interessado." })
+		}
+	}
+
+	/**
+	 * PUT /chamados/:id/responsavel
+	 * Designar operador responsável (operadores/admins).
+	 */
+	async assignResponsavel(req, res) {
+		try {
+			const role = getRole(req)
+			if (!isOperatorRole(role)) {
+				return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "Sem permissão." })
+			}
+
+			const chamadoId = String(req.params.id || "").trim()
+			const responsavelUserId = req.body?.userId ? String(req.body.userId).trim() : null
+
+			if (!chamadoId) {
+				return res.status(400).json({ ok: false, error: "BAD_REQUEST", message: "ID inválido." })
+			}
+
+			await sql`
+				UPDATE chamados
+				SET responsavel_user_id = ${responsavelUserId}, updated_at = now()
+				WHERE id = ${chamadoId}
+			`
+
+			return res.json({ ok: true })
+		} catch (err) {
+			console.error("[ChamadosController.assignResponsavel]", err)
+			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao designar responsável." })
+		}
+	}
+
+	/**
+	 * PUT /chamados/:id/reopen
+	 * Reabrir chamado resolvido/cancelado (operadores/admins).
+	 */
+	async reopen(req, res) {
+		try {
+			const userId = getUserId(req)
+			const role = getRole(req)
+			if (!isOperatorRole(role)) {
+				return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "Apenas operadores/admins podem reabrir chamados." })
+			}
+
+			const chamadoId = String(req.params.id || "").trim()
+			const comentario = String(req.body?.comentario || "Chamado reaberto.").trim()
+
+			if (!chamadoId) {
+				return res.status(400).json({ ok: false, error: "BAD_REQUEST", message: "ID inválido." })
+			}
+
+			const existing = await sql`
+				SELECT c.id, c.status, c.codigo, c.titulo,
+				       c.user_id AS "userId", u.name AS "ownerName", u.email AS "ownerEmail"
+				FROM chamados c
+				JOIN users u ON u.id = c.user_id
+				WHERE c.id = ${chamadoId} LIMIT 1
+			`
+			const chamado = existing?.[0]
+			if (!chamado) {
+				return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Chamado não encontrado." })
+			}
+			if (chamado.status !== "Resolvido" && chamado.status !== "Cancelado") {
+				return res.status(400).json({ ok: false, error: "VALIDATION", message: "Somente chamados encerrados podem ser reabertos." })
+			}
+
+			const novoStatus = "Recebido"
+			await sql`
+				UPDATE chamados SET status = ${novoStatus}, updated_at = now() WHERE id = ${chamadoId}
+			`
+			await sql`
+				INSERT INTO chamado_historico (chamado_id, author_user_id, status, comentario)
+				VALUES (${chamadoId}, ${userId}, ${novoStatus}, ${comentario})
+			`
+
+			// Notificar
+			try {
+				const actorInfo = await getActorInfo(userId)
+				const meta = extractAuditMeta(req)
+				await auditAndNotify({
+					action: "chamado.reopened",
+					entityType: "chamado",
+					entityId: chamadoId,
+					actor: { userId, name: actorInfo?.name, email: actorInfo?.email, role },
+					target: { userId: chamado.userId, name: chamado.ownerName, email: chamado.ownerEmail },
+					ip: meta.ip,
+					userAgent: meta.userAgent,
+					emailSubject: `[Chamado ${chamado.codigo}] Reaberto`,
+					emailDetails: [
+						{ label: "Código", value: chamado.codigo, bold: true },
+						{ label: "Título", value: chamado.titulo },
+						{ label: "Status anterior", value: chamado.status },
+						{ label: "Novo status", value: novoStatus, bold: true },
+						{ label: "Comentário", value: comentario },
+					],
+				})
+			} catch { /* non-blocking */ }
+
+			return res.json({ ok: true, status: novoStatus })
+		} catch (err) {
+			console.error("[ChamadosController.reopen]", err)
+			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao reabrir chamado." })
 		}
 	}
 }
