@@ -285,10 +285,171 @@ export class ChamadosController {
 				})
 			} catch { /* non-blocking */ }
 
+			// Notificar interessados sobre a criação do chamado
+			if (chamado?.id && interessadosIds.length > 0) {
+				try {
+					const { sendEmail } = await import("../services/email/brevoEmail.js")
+					const actorInfo = await getActorInfo(userId)
+					const adminEmails = (await getAdminEmails()).map((a) => a.email)
+					for (const intId of interessadosIds) {
+						try {
+							const intInfo = await getActorInfo(intId)
+							if (!intInfo?.email) continue
+							// Não duplicar para o criador ou admins (já notificados)
+							if (intInfo.email === actorInfo?.email) continue
+							if (adminEmails.includes(intInfo.email)) continue
+
+							const greeting = intInfo.name ? `Olá, ${intInfo.name}!` : "Olá!"
+							const introText = `Você foi adicionado(a) como interessado(a) no chamado ${codigo}.`
+							await sendEmail({
+								to: intInfo.name ? `${intInfo.name} <${intInfo.email}>` : intInfo.email,
+								subject: `[Novo Chamado] ${codigo} — ${titulo}`,
+								text: `${greeting}\n\n${introText}\n\nCódigo: ${codigo}\nTítulo: ${titulo}\nPrioridade: ${prioridade}\nDescrição: ${descricao}`,
+								html: `<p>${greeting}</p><p>${introText}</p><p><strong>Código:</strong> ${codigo}<br><strong>Título:</strong> ${titulo}<br><strong>Prioridade:</strong> ${prioridade}<br><strong>Descrição:</strong> ${descricao}</p>`,
+							})
+						} catch { /* ignore individual email failures */ }
+					}
+				} catch { /* non-blocking */ }
+			}
+
 			return res.status(201).json({ ok: true, chamado })
 		} catch (err) {
 			console.error("[ChamadosController.create]", err)
 			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao criar chamado." })
+		}
+	}
+
+	/**
+	 * POST /chamados/:id/comentario
+	 * Qualquer participante (dono, interessado, operador/admin) pode adicionar
+	 * um comentário/mensagem ao chamado sem alterar o status.
+	 */
+	async addComment(req, res) {
+		try {
+			const userId = getUserId(req)
+			const role = getRole(req)
+			const chamadoId = String(req.params.id || "").trim()
+			const comentario = String(req.body?.comentario || "").trim()
+
+			if (!chamadoId) {
+				return res.status(400).json({ ok: false, error: "BAD_REQUEST", message: "ID inválido." })
+			}
+			if (comentario.length < 3) {
+				return res.status(400).json({ ok: false, error: "VALIDATION", message: "Comentário deve ter pelo menos 3 caracteres." })
+			}
+
+			// Buscar chamado
+			const existing = await sql`
+				SELECT c.id, c.user_id AS "userId", c.status, c.codigo, c.titulo,
+				       u.name AS "ownerName", u.email AS "ownerEmail"
+				FROM chamados c
+				JOIN users u ON u.id = c.user_id
+				WHERE c.id = ${chamadoId}
+				LIMIT 1
+			`
+			const chamado = existing?.[0]
+			if (!chamado) {
+				return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Chamado não encontrado." })
+			}
+
+			// Não permitir comentários em chamados encerrados
+			if (chamado.status === "Resolvido" || chamado.status === "Cancelado") {
+				return res.status(400).json({ ok: false, error: "VALIDATION", message: "Não é possível comentar em chamados encerrados." })
+			}
+
+			// Permissão: operadores/admins podem sempre; clientes apenas no próprio ou se interessado
+			if (!isOperatorRole(role)) {
+				if (chamado.userId !== userId) {
+					const isInteressado = await sql`
+						SELECT 1 FROM chamado_interessados
+						WHERE chamado_id = ${chamadoId} AND user_id = ${userId}
+						LIMIT 1
+					`
+					if (!isInteressado || isInteressado.length === 0) {
+						return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "Sem permissão." })
+					}
+				}
+			}
+
+			// Inserir comentário no histórico (status = NULL indica comentário avulso)
+			await sql`
+				INSERT INTO chamado_historico (chamado_id, author_user_id, status, comentario)
+				VALUES (${chamadoId}, ${userId}, NULL, ${comentario})
+			`
+
+			// Atualizar updated_at
+			await sql`
+				UPDATE chamados SET updated_at = now() WHERE id = ${chamadoId}
+			`
+
+			// Notificar dono do chamado + admins + interessados
+			try {
+				const actorInfo = await getActorInfo(userId)
+				const meta = extractAuditMeta(req)
+				const autorNome = actorInfo?.name || "Alguém"
+
+				await auditAndNotify({
+					action: "chamado.comment_added",
+					entityType: "chamado",
+					entityId: chamadoId,
+					actor: {
+						userId,
+						name: actorInfo?.name,
+						email: actorInfo?.email,
+						role: getRole(req),
+					},
+					target: {
+						userId: chamado.userId,
+						name: chamado.ownerName,
+						email: chamado.ownerEmail,
+					},
+					ip: meta.ip,
+					userAgent: meta.userAgent,
+					emailSubject: `[Chamado ${chamado.codigo}] Nova mensagem de ${autorNome}`,
+					emailDetails: [
+						{ label: "Código", value: chamado.codigo, bold: true },
+						{ label: "Título", value: chamado.titulo },
+						{ label: "Autor", value: autorNome },
+						{ label: "Mensagem", value: comentario },
+					],
+				})
+
+				// Notificar interessados
+				try {
+					const interessados = await sql`
+						SELECT ci.user_id AS "userId", u.name, u.email
+						FROM chamado_interessados ci
+						JOIN users u ON u.id = ci.user_id
+						WHERE ci.chamado_id = ${chamadoId}
+					`
+					if (interessados.length > 0) {
+						const { sendEmail } = await import("../services/email/brevoEmail.js")
+						const adminEmails = (await getAdminEmails()).map((a) => a.email)
+						for (const int of interessados) {
+							if (int.email === chamado.ownerEmail) continue
+							if (int.userId === userId) continue
+							if (adminEmails.includes(int.email)) continue
+							if (!int.email) continue
+
+							try {
+								const greeting = int.name ? `Olá, ${int.name}!` : "Olá!"
+								const introText = `Nova mensagem no chamado ${chamado.codigo} por ${autorNome}.`
+								await sendEmail({
+									to: int.name ? `${int.name} <${int.email}>` : int.email,
+									subject: `[Chamado ${chamado.codigo}] Nova mensagem de ${autorNome}`,
+									text: `${greeting}\n\n${introText}\n\nMensagem: ${comentario}`,
+									html: `<p>${greeting}</p><p>${introText}</p><p><strong>Mensagem:</strong> ${comentario}</p>`,
+								})
+							} catch { /* ignore */ }
+						}
+					}
+				} catch { /* non-blocking */ }
+			} catch { /* non-blocking */ }
+
+			return res.json({ ok: true })
+		} catch (err) {
+			console.error("[ChamadosController.addComment]", err)
+			return res.status(500).json({ ok: false, error: "INTERNAL", message: "Erro ao adicionar comentário." })
 		}
 	}
 

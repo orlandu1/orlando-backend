@@ -10,6 +10,7 @@ router.get("/users", authRequired, (req, res) => controller.listUsers(req, res))
 router.get("/", authRequired, (req, res) => controller.list(req, res))
 router.get("/:id", authRequired, (req, res) => controller.get(req, res))
 router.post("/", authRequired, (req, res) => controller.create(req, res))
+router.post("/:id/comentario", authRequired, (req, res) => controller.addComment(req, res))
 router.put("/:id/status", authRequired, (req, res) => controller.updateStatus(req, res))
 
 export default router
